@@ -1,0 +1,32 @@
+# Postgres 16 + pgvector for local development.
+services:
+  db:
+    # pgvector/pgvector ships the extension pre-built for the matching PG major.
+    # Building it into the official postgres image ourselves would mean a custom
+    # Dockerfile and a compile step on every fresh machine.
+    image: pgvector/pgvector:pg16
+    container_name: skillian-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: skillian
+      POSTGRES_PASSWORD: skillian
+      POSTGRES_DB: skillian
+    ports:
+      # Host port is configurable: 5432 is frequently already taken by
+      # another project's Postgres. Override with POSTGRES_PORT in .env.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Files in this directory run once, on first init of an empty data volume.
+      # CREATE EXTENSION is also repeated in the Alembic migration so a database
+      # provisioned outside Compose still works.
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Alembic/ingest should not start against a server still replaying WAL.
+      test: ["CMD-SHELL", "pg_isready -U skillian -d skillian"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:

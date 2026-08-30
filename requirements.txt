@@ -1,0 +1,21 @@
+# Web framework — structure only on day 1, no endpoints yet.
+fastapi>=0.115,<0.120
+uvicorn[standard]>=0.32,<0.35
+
+# ORM + migrations. SQLAlchemy 2.x typed ORM (Mapped/mapped_column) throughout.
+SQLAlchemy>=2.0.36,<2.1
+alembic>=1.14,<2.0
+
+# psycopg 3 (not psycopg2): async-capable later without swapping drivers,
+# and it is the driver SQLAlchemy 2.x treats as default for "postgresql+psycopg".
+psycopg[binary]>=3.2,<4.0
+
+# pgvector's SQLAlchemy type adapter for the vector(1536) columns.
+pgvector>=0.3.6,<0.5
+
+# HTTP client for job sources. httpx over requests: same API sync+async,
+# so a source can go async later without a rewrite.
+httpx>=0.28,<0.29
+
+pydantic>=2.10,<3.0
+pydantic-settings>=2.7,<3.0

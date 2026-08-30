@@ -1,0 +1,279 @@
+"""SQLAlchemy models for the whole Skillian schema.
+
+All eight tables are defined on day 1 even though only ``jobs`` and
+``ingestion_runs`` are written today: the initial Alembic migration then covers
+the full shape, and later days add code against existing tables rather than
+stacking migrations on a half-built schema.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base
+
+# text-embedding-3-small / ada-002 width. Named once: changing the embedding
+# model means one edit here plus one migration, not a grep across the schema.
+EMBEDDING_DIM = 1536
+
+
+def _uuid_pk() -> Mapped[uuid.UUID]:
+    """UUID primary key generated in Python, not by the database.
+
+    Avoids depending on pgcrypto / uuid-ossp being installed, and lets application
+    code know a row's id before INSERT (useful for building FK graphs in memory).
+    """
+    return mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    resumes: Mapped[list["Resume"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class Resume(Base):
+    __tablename__ = "resumes"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured parse output (sections, dates, titles). The shape is still in
+    # flux on day 1, so JSONB rather than premature columns.
+    parsed: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Nullable: a resume exists before it has been embedded.
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(EMBEDDING_DIM), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user: Mapped[User] = relationship(back_populates="resumes")
+
+    # Every resume lookup is "the resumes belonging to this user"; the FK
+    # alone does not create an index in Postgres.
+    __table_args__ = (Index("ix_resumes_user_id", "user_id"),)
+
+
+class Skill(Base):
+    __tablename__ = "skills"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    # Postgres array rather than a join table: aliases are a small, read-mostly
+    # bag of strings ("js", "ecmascript") that is only ever fetched alongside its
+    # skill and never queried independently.
+    aliases: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
+
+
+class ResumeSkill(Base):
+    """Association: which skills a resume evidences."""
+
+    __tablename__ = "resume_skills"
+
+    resume_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("resumes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("skills.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # How the link was established: "parsed" | "llm" | "manual". Free text, not an
+    # enum, because adding an extractor should not require a migration.
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The composite PK already covers (resume_id, skill_id); this serves the
+    # reverse lookup "which resumes have this skill".
+    __table_args__ = (Index("ix_resume_skills_skill_id", "skill_id"),)
+
+
+class JobSkill(Base):
+    """Association: which skills a job asks for."""
+
+    __tablename__ = "job_skills"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("skills.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # "required" | "preferred" | "nice_to_have" — free text for the same reason.
+    requirement: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Reverse lookup: "which jobs want this skill".
+    __table_args__ = (Index("ix_job_skills_skill_id", "skill_id"),)
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # --- provenance -------------------------------------------------------
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_job_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # sha256 hex of normalised company + title + city. Deliberately NOT unique:
+    # the same posting legitimately appears on several boards and we keep every
+    # copy (each has its own apply_url) while still being able to group them.
+    dedup_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # --- content ----------------------------------------------------------
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    company: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_remote: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apply_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- salary -----------------------------------------------------------
+    # salary_raw is always kept: parsing is lossy and best-effort, and the raw
+    # string is the only thing we can show a user without risking a wrong number.
+    salary_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Numeric, not Float: money must not accumulate binary rounding error.
+    # 14,2 comfortably holds annual INR figures.
+    salary_min: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    salary_max: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    salary_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    # "year" | "month" | "day" | "hour" — normalising everything to an annual
+    # figure would need assumptions (hours/week) we cannot make safely at ingest.
+    salary_period: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # --- experience -------------------------------------------------------
+    experience_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    experience_min_years: Mapped[Decimal | None] = mapped_column(
+        Numeric(4, 1), nullable=True
+    )
+
+    # --- timestamps -------------------------------------------------------
+    posted_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(EMBEDDING_DIM), nullable=True
+    )
+
+    __table_args__ = (
+        # The upsert target. (source, source_job_id) is the only identifier a
+        # provider guarantees stable, so it — not dedup_hash — defines identity.
+        UniqueConstraint("source", "source_job_id", name="uq_jobs_source_source_job_id"),
+        Index("ix_jobs_dedup_hash", "dedup_hash"),
+    )
+
+
+class Match(Base):
+    """Scored resume x job pair. Written from day 3; defined now."""
+
+    __tablename__ = "matches"
+
+    resume_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("resumes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # 5,4 = 0.0000..1.0000. Scores are ratios, so fixed precision beats float.
+    overall_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    semantic_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    skill_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    matching_skills: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    missing_skills: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which scorer produced this row, so results can be invalidated selectively
+    # when the model or prompt changes instead of wiping the table.
+    model_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # The ranking query: one resume's matches, best score first.
+        Index(
+            "ix_matches_resume_id_overall_score",
+            "resume_id",
+            text("overall_score DESC"),
+        ),
+    )
+
+
+class IngestionRun(Base):
+    """One invocation of the ingest pipeline — the audit trail for a fetch."""
+
+    __tablename__ = "ingestion_runs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    # Nullable: day-1 ingestion is not tied to a resume, later runs will be.
+    # SET NULL on delete so removing a resume does not erase the run history.
+    resume_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("resumes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # "running" | "success" | "partial" | "failed".
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    sources: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
+    jobs_found: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

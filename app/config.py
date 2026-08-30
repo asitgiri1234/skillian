@@ -47,6 +47,28 @@ class Settings(BaseSettings):
     results_per_page: int = Field(default=50, ge=1, le=50)
     max_pages: int = Field(default=5, ge=1)
 
+    # --- Providers --------------------------------------------------------
+    # Selects the implementation in app/providers/. Everything downstream depends
+    # on the ABC, so swapping to a hosted model is a config change, not a code
+    # change. Validated against the registry at construction time.
+    llm_provider: str = "ollama"
+    embedding_provider: str = "ollama"
+
+    # --- Ollama -----------------------------------------------------------
+    ollama_host: str = "http://localhost:11434"
+    # 7b, not 3b: extraction quality on messy resume text is the bottleneck here,
+    # and this runs locally where a slower model costs time rather than money.
+    ollama_llm_model: str = "qwen2.5:7b"
+    # 768-dimensional. Must agree with models.EMBEDDING_DIM.
+    ollama_embed_model: str = "nomic-embed-text"
+    # A 7b model on CPU can take well over a minute for a long resume.
+    ollama_timeout_seconds: float = 180.0
+
+    # --- Extraction -------------------------------------------------------
+    # Attempts for the validate-and-retry loop in app/structure.py. Constrained
+    # decoding fixes shape, not accuracy, so retries are about semantic failures.
+    extraction_max_attempts: int = Field(default=3, ge=1, le=6)
+
     log_level: str = "INFO"
 
 

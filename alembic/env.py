@@ -9,6 +9,7 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import engine_from_config, pool
 
 from app.config import get_settings
@@ -29,6 +30,20 @@ config.set_main_option("sqlalchemy.url", get_settings().database_url)
 target_metadata = Base.metadata
 
 
+def render_item(type_: str, obj: object, autogen_context: object) -> str | bool:
+    """Render pgvector columns correctly during autogenerate.
+
+    Without this, autogenerate emits a bare ``pgvector.sqlalchemy.vector.VECTOR``
+    reference and no matching import, producing a migration that dies with
+    NameError the first time it runs. Returning False defers to Alembic's default
+    rendering for every other type.
+    """
+    if type_ == "type" and isinstance(obj, Vector):
+        autogen_context.imports.add("from pgvector.sqlalchemy import Vector")
+        return f"Vector({obj.dim})"
+    return False
+
+
 def run_migrations_offline() -> None:
     """Emit SQL to stdout without connecting (alembic upgrade --sql)."""
     context.configure(
@@ -38,6 +53,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         # Detect column type changes on autogenerate, not just added/dropped ones.
         compare_type=True,
+        render_item=render_item,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -58,6 +74,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            render_item=render_item,
         )
         with context.begin_transaction():
             context.run_migrations()

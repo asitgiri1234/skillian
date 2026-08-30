@@ -1,4 +1,6 @@
-# Decisions — Day 1 (ingestion path)
+# Decisions
+
+# Day 1 (ingestion path)
 
 Every significant choice made building the ingestion pipeline, what was rejected,
 and why. Scope was deliberately limited to ingestion: no matching, embeddings,
@@ -481,3 +483,286 @@ every Adzuna test ran against `httpx.MockTransport` with fixtures shaped to the
 documented response. The response-shape assumptions (field names, `"0"`/`"1"`
 string for `salary_is_predicted`, ISO-8601 `created`, country-implied currency)
 are the thing to confirm first with a real key.
+
+---
+
+# Decisions — Day 2 (local model providers)
+
+Ollama for both LLM and embeddings, behind provider abstractions. Still no
+matching, no API endpoints, no UI.
+
+---
+
+## 10. Provider abstraction
+
+### 10.1 Two separate ABCs, not one "AI provider"
+
+`LLMProvider` and `EmbeddingProvider` live in different modules with different
+error hierarchies.
+
+- **Why:** they fail differently and scale differently. An embedding call is
+  ~100ms and batches; a 7b extraction is ~70s and does not. Fusing them would
+  force one timeout, one retry policy and one set of errors onto two operations
+  that share nothing but a transport. They are also independently swappable —
+  local embeddings with a hosted LLM is a reasonable configuration, and the
+  separate `EMBEDDING_PROVIDER` / `LLM_PROVIDER` flags allow it.
+
+### 10.2 `complete()` returns a plain `dict`, and deliberately does not validate
+
+The signature is `complete(prompt, schema) -> dict`, exactly as specified. The
+provider passes `schema` to the decoder but never calls `model_validate`.
+
+- **Why:** a provider that validated would have to own a retry policy, and that
+  policy belongs with the caller that knows what a good answer looks like.
+  `structure.py` retries with error feedback; a future summariser might accept a
+  partial result. Keeping the provider dumb keeps that choice open.
+- **Verified:** `complete()` returns `{"skills": [], "experience": []}` — an
+  object that fails `ParsedResume` validation — without raising.
+
+### 10.3 Explicit registry dicts, not package scanning
+
+`LLM_PROVIDERS` / `EMBEDDING_PROVIDERS` in `app/providers/__init__.py`.
+
+- **Why:** same reasoning as `SOURCE_REGISTRY` on day 1. A typo in
+  `LLM_PROVIDER` should produce "not registered, available: ollama", not an
+  `ImportError` from a mistyped module name. Flags are matched
+  case-insensitively.
+
+### 10.4 Three error types, split by who can fix them
+
+`LLMUnavailableError` (operator: daemon down, model not pulled) vs
+`LLMResponseError` (backend replied with junk); same split for embeddings, plus
+`EmbeddingDimensionError`.
+
+- **Why:** it determines whether retrying is sensible. `structure.py` retries
+  validation failures but lets `LLMUnavailableError` propagate immediately — a
+  stopped daemon will not fix itself, and retrying only delays a clear message.
+- The 404 case is mapped specially because "model not pulled" is by far the most
+  common first-run failure. The error carries the literal fix:
+  `ollama pull qwen2.5:7b`. A connection error suggests `ollama serve`.
+
+### 10.5 `EmbeddingDimensionError` exists as its own type
+
+- **Why:** a width mismatch otherwise surfaces as an opaque pgvector error at
+  INSERT, far from the cause. Catching it at the provider boundary names the
+  real problem (wrong model configured) at the point it can be understood.
+
+### 10.6 `embed_batch` is concrete on the ABC, overridden by Ollama
+
+The default loops over `embed()`; `OllamaEmbeddingProvider` overrides it because
+`/api/embed` accepts a list.
+
+- **Why:** a new provider only has to implement one method, but the one that has
+  a real batch endpoint uses it. Measured: 3 texts in one round-trip took 0.104s
+  against ~2s for a single cold call — the round-trip dominates completely.
+
+### 10.7 Clients are injectable
+
+`OllamaLLMProvider(settings=..., client=...)`, matching `AdzunaSource` from
+day 1.
+
+- **Why:** it is what let every error-mapping path (404, connection refused,
+  non-JSON reply) be tested with no daemon and no model.
+
+---
+
+## 11. Embedding model and the 768 migration
+
+### 11.1 `EMBEDDING_DIM` 1536 -> 768, in `models.py` before generating the migration
+
+As instructed, and the ordering matters: autogenerate diffs the models against
+the live database, so changing the constant first is what produces the migration
+at all.
+
+### 11.2 Migration `0002` nulls existing vectors before altering the column
+
+- **Why (mechanical):** Postgres cannot cast `vector(1536)` to `vector(768)`;
+  the ALTER fails outright on any non-null row.
+- **Why (the real reason):** an embedding from a *different model* is not
+  comparable to one from nomic-embed-text. Distances between them are
+  meaningless, so the vectors must be regenerated regardless. Truncating them to
+  768 would produce plausible-looking garbage — numerically valid, semantically
+  worthless. The downgrade is symmetric for the same reason.
+- Safe today because nothing generates embeddings yet, so every row is already
+  NULL. Written explicitly so the migration stays correct when that changes.
+
+### 11.3 Alembic autogenerate produced a broken migration; fixed at the source
+
+The generated file referenced `pgvector.sqlalchemy.vector.VECTOR` with **no
+matching import** — it would have died with `NameError` on first run.
+
+- **Fix:** a `render_item` hook in `alembic/env.py` that renders `Vector(dim)`
+  and registers the import. Patching the one generated file would have left the
+  same trap for every future autogenerate; this fixes the generator.
+- **Caught by:** reading the generated migration instead of trusting it.
+
+### 11.4 The dimension check is in `check_ollama.py`, not at import time
+
+- **Why:** `EMBEDDING_DIM` and the provider's `dimension` must agree, but
+  asserting it at import would mean every `import app.models` needs a running
+  Ollama. The preflight script is where that check belongs — it already requires
+  the daemon.
+
+---
+
+## 12. Structured extraction
+
+### 12.1 The schema is passed as `format=`; the prompt never mentions JSON
+
+`ollama.chat(format=ParsedResume.model_json_schema(), options={"temperature": 0})`.
+
+- **Why:** constrained decoding makes malformed output *unrepresentable* at the
+  token level, rather than merely discouraged by an instruction the model may
+  ignore. Instructions about formatting would be redundant tokens that also
+  invite the model to editorialise ("Here is the JSON you asked for:").
+- **Verified:** the system and user prompts are asserted to contain no mention
+  of JSON.
+
+### 12.2 `temperature=0`
+
+- **Why:** extraction is not a creative task. The same resume must produce the
+  same parse, or caching and the retry loop both become meaningless.
+- **Consequence that had to be handled:** at temperature 0 a plain retry is
+  deterministic and returns the identical bad answer. That is precisely why the
+  retry feeds the validation errors back into the next prompt — changing the
+  input is the only thing that changes the output. Without that, the retry loop
+  would be three identical failures.
+
+### 12.3 The validate-and-retry loop is kept, and its validators check *meaning*
+
+Constrained decoding guarantees shape, not accuracy — so type checks would be
+redundant with the grammar. Every validator here targets something the grammar
+cannot express:
+
+- **Placeholders**, including the literal string `"string"`. This is not
+  hypothetical: it is copied straight out of the schema's own vocabulary, and
+  constrained decoding makes it *more* likely, not less.
+- **Fake emails** — `@example.com`, or anything without a plausible domain. A
+  missing email is fine; a wrong one is worse than nothing.
+- **Duplicate/junk skills** — JSON schema can say "array of strings", not "no
+  duplicates, no sentences".
+- **Implausible years** — a graduation year of 12 is a page number.
+- **The empty parse** — a well-formed object with no skills and no experience.
+  This is the single most valuable check: without it the pipeline would store an
+  empty resume and every downstream match would be garbage.
+
+**Verified:** the loop recovers on attempt 2 when attempt 1 returns an empty
+parse, feeds the failure text into the retry prompt, and raises `StructureError`
+carrying the last errors after exhausting attempts.
+
+### 12.4 Every field is required-but-nullable — the day's most important finding
+
+This was found by testing, not by reasoning, and it is worth defending carefully.
+
+Pydantic only lists a field as `required` in its JSON schema when the field has
+**no default**. With `= None` defaults everywhere, `required` was empty, the
+generated grammar made every key optional, and the model took the cheapest legal
+path: `qwen2.5:7b` returned a valid object containing `skills`, `experience`,
+`education` and `total_years_experience` — and silently omitted `name`, `email`,
+`phone`, `location` and `summary`, plus `company` inside every role. The
+preflight reported `name: None`, `email: None` on a resume that plainly contains
+both.
+
+The fix is to give the fields no default while keeping the type nullable
+(`str | None` with a bare `Field(description=...)`). The key must then be
+emitted, but `null` remains a legal value. "I looked and there is nothing here"
+is a real answer; a missing key is not.
+
+- **Rejected:** adding `minItems: 1` to `skills`. It would force the grammar to
+  emit at least one skill even for a document that is not a resume, converting a
+  detectable failure into a confident hallucination. The empty-parse validator
+  catches that case honestly instead.
+- **Generalisable lesson:** with constrained decoding, the schema *is* the
+  prompt. Anything optional in the schema is an invitation to omit.
+
+### 12.5 Dates stay free text
+
+`start_date: str | None`, not a date type.
+
+- **Why:** resumes write dates a dozen ways ("Jan 2020", "2020-01", "Spring
+  2020", "Present"). Forcing an ISO date makes the model guess, and a wrong
+  parsed date is worse than the original string. Normalising is a later problem
+  that can be done offline from the preserved text.
+
+### 12.6 Input truncated at 24,000 chars
+
+- **Why:** qwen2.5 has a 32k context, but a long resume plus the schema plus
+  retry feedback can still crowd it. Explicit truncation with a warning beats
+  silent server-side truncation that would drop the education section without
+  saying so.
+
+### 12.7 `ParsedResume` is not yet persisted
+
+`resumes.parsed` (JSONB) and `resumes.embedding` exist and stay empty.
+
+- **Why:** the brief scoped this session to providers plus extraction. Wiring
+  extraction into a resume-upload path is day 3, and doing it now would mean
+  guessing at that path's shape.
+
+---
+
+## 13. Models chosen
+
+### 13.1 `qwen2.5:7b` for extraction, not 3b
+
+- **Why:** measured, not assumed. `qwen2.5:3b` failed extraction three times in
+  a row on the sample resume — it returned objects with no skills and no
+  experience at all. 7b succeeds on the first attempt with all 8 skills, both
+  roles and correct contact details. Extraction quality is the bottleneck for
+  everything downstream, and locally a bigger model costs time rather than money.
+- **Cost recorded:** ~72s per extraction on this machine (CPU). That is slow
+  enough that batch resume processing will need to be a background job, not a
+  request-time operation — worth knowing before endpoints get designed.
+
+### 13.2 `nomic-embed-text` for embeddings
+
+- 768 dimensions, 274 MB, ~0.03s per text warm.
+- **Sanity-checked, not assumed:** cosine similarity of "python backend" to
+  "python backend engineer" is 0.85, against 0.50 for "react frontend". The
+  ordering is what the matching stage will depend on.
+
+### 13.3 Ollama for both
+
+- **Why:** no API cost and no data leaving the machine — resumes are personal
+  data, which makes local inference a privacy property, not just a budget one.
+- **Trade-off accepted and stated:** ~72s per extraction is far slower than a
+  hosted model. The abstraction is what makes that reversible: swapping to a
+  hosted LLM is a new file in `app/providers/` plus a config flag, with no
+  caller changes.
+
+---
+
+## 14. Verification performed (day 2)
+
+Ran against the real Ollama daemon and the real database.
+
+| Check | Result |
+|---|---|
+| `check_ollama.py` full run, exit 0 | pass |
+| Migration `0002` up, `vector(768)` on both columns | pass |
+| `0002` downgrade -> `vector(1536)` -> re-upgrade -> `vector(768)` | pass |
+| `alembic check` (no model/migration drift) | pass |
+| Autogenerated migration missing pgvector import | found and fixed via `render_item` |
+| Real embedding: 768 dims, matches `EMBEDDING_DIM` | pass |
+| Embedding semantics: 0.85 related vs 0.50 unrelated | pass |
+| `embed_batch` = one round-trip (0.104s for 3) | pass |
+| Empty-text and dimension-mismatch guards | pass |
+| Real extraction: name, email, location, 8 skills, 2 roles, education | pass |
+| Schema passed as `format=`; prompts never mention JSON | pass |
+| Retry loop recovers on attempt 2; feeds errors back | pass |
+| `StructureError` after exhausted attempts, carries errors | pass |
+| All accuracy validators (placeholder, email, dedup, year, empty) | pass |
+| Registry: valid flags, case-insensitivity, unknown flag lists options | pass |
+| Error mapping: 404 -> pull hint, conn refused -> `ollama serve`, non-JSON | pass |
+| Day 1 suites re-run after the dimension change | pass, no regressions |
+
+**Still not verified:** a live Adzuna API call (unchanged from day 1 — no
+credentials). Extraction is verified against exactly one synthetic resume; real
+resumes are messier (multi-column PDFs, tables, headers) and the 24k truncation
+and date handling have not been exercised against them.
+
+**Still no committed tests.** The day 2 work was verified by three more scratch
+scripts. This is now two days of accumulated verification living outside the
+repo, and the case for promoting it to `tests/` is stronger than it was
+yesterday — the provider fakes and the retry-loop fixtures are exactly what
+would be expensive to reconstruct later.

@@ -19,3 +19,7 @@ httpx>=0.28,<0.29
 
 pydantic>=2.10,<3.0
 pydantic-settings>=2.7,<3.0
+
+# Local LLM + embeddings. Pinned minor: the structured-output `format=` parameter
+# on chat() landed in 0.4 and is the whole basis of the extraction path.
+ollama>=0.4,<1.0

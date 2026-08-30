@@ -34,9 +34,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
 
-# text-embedding-3-small / ada-002 width. Named once: changing the embedding
-# model means one edit here plus one migration, not a grep across the schema.
-EMBEDDING_DIM = 1536
+# nomic-embed-text's output width. Named once: changing the embedding model
+# means one edit here plus one migration, not a grep across the schema.
+# Must match EmbeddingProvider.dimension — scripts/check_ollama.py asserts it.
+EMBEDDING_DIM = 768
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:

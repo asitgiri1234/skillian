@@ -2078,3 +2078,175 @@ silently would hide that the previous prune both worked and was incomplete.
 Extraction 25.1s for 326 jobs (77ms/job — up from 16ms because the documents are
 11x longer). Embedding 953 chunks in 474.6s, which is now the slowest stage by a
 wide margin at ~0.5s/chunk, exactly as measured on day 3b.
+
+---
+
+# Decisions — Day 3f (vocabulary scoped to named things; first real calibration)
+
+## 28. The scoping rule
+
+Vocabulary is now **named technologies and named specific practices only**.
+Abstract competencies and category nouns are out.
+
+The test: *can a matcher verify this against a posting?* "Does this job require
+Kubernetes" is answerable. "Does this job require Security" is not — it meant
+different things in 75 different postings, including "Account Executive" and
+"Accountant II".
+
+**This reverses 25.2, which kept Security and Agile as borderline.** That call
+was made against 500-character Adzuna teasers. Full-length descriptions changed
+the answer, and the reversal is recorded rather than quietly applied: an
+abstract term in a 5,000-character document has ten times the surface area to
+collide with prose.
+
+21 further terms blocked (59 total): Security, Observability, Agile, Scrum,
+Sales, Presentation, written communication, Technical Writing, Accessibility,
+Authentication, Authorization, Code Review, Incident Response, Performance
+Tuning, API Design, Data Modelling, Data Pipelines, Unit Testing, Web Scraping,
+design systems, Excel.
+
+**Kept**, and worth naming because they look similar but survive the test:
+Microservices (named architecture), System Design, distributed systems and Data
+Structures (named specific practices), RAG and LLM (named techniques), UPI, P2P,
+QR (narrow domain terms), Looker and Salesforce (named products).
+
+### 28.1 The alias audit
+
+`monitoring -> Observability` was the direct cause of that term matching
+accountancy roles. Auditing all seeded aliases against the rule — *an alias must
+be an abbreviation or spelling variant, never an ordinary English word that
+merely co-occurs* — found 13 more of the same failure mode:
+
+| Alias | Was pointing at | Why it is wrong |
+|---|---|---|
+| monitoring | Observability | ordinary word; matched "Accountant II" |
+| shell, sh | Bash | "shell company"; `sh` is two letters |
+| spring | Spring Boot | the season |
+| rest | REST APIs | "the rest of the team" |
+| node | Node.js | "node in the graph" |
+| torch | PyTorch | ordinary word |
+| **cv** | Computer Vision | **curriculum vitae — in job postings** |
+| lambda | Serverless | Python keyword, mathematical term |
+| on-call, on call | Incident Response | prose in most engineering postings |
+| scraping | Web Scraping | ordinary word |
+| unix | Linux | a different OS, not an alias at all |
+
+`k8s -> Kubernetes`, `postgres -> PostgreSQL`, `js -> JavaScript` are correct and
+kept. Recorded in `skill_seed.REJECTED_ALIASES` so they are not re-added.
+
+### 28.2 Ambiguous technology names get an evidence test, not a blocklist
+
+Spark, Vault, Envoy, Playwright, Jest, Express, Rails, Oracle, pandas, Cypress
+and Selenium are genuine verifiable technologies whose names are ordinary
+English words. Blocklisting them would be wrong — "does this posting require
+Apache Spark" is exactly what a matcher *can* answer. They now go through the
+same evidence test as `R` and `Go` (`_short_name_ok`): list punctuation or an
+adjacent qualifier, or no match. Measured cause: "Spark" matched "Account
+Maintenance Associate" via prose like "spark innovation".
+
+Excel is the exception — blocklisted rather than guarded, because the English
+verb ("excel at this role") is overwhelmingly the more common sense in postings.
+
+### 28.3 Results
+
+Active rows 270 -> 249 (308 total, unchanged — nothing deleted). Index 295 ->
+252 surface forms. Re-extraction 23.3s over 326 jobs.
+
+**The head is now entirely named technologies:**
+
+    68 Python · 45 Machine Learning · 40 Microservices · 39 SQL · 37 Java
+    35 UPI · 33 LLM · 27 AWS · 23 Salesforce · 17 Azure · 17 GCP
+    15 TypeScript · 15 distributed systems · 14 Spark · 14 Kubernetes
+
+No obvious false-positive class remains in the head.
+
+| | before | after |
+|---|---|---|
+| required / preferred | 1202 / 92 | **824 / 67** |
+| adzuna | 150 / 0 | 138 / 0 |
+| greenhouse | 451 / 42 | 268 / 24 |
+| lever | 601 / 50 | 418 / 43 |
+
+Zero-skill jobs rose from 58 to 115 of 326, and **57 jobs lost all their
+skills**. That number looks alarming and mostly is not:
+
+* **63 of the 115 are non-engineering postings** — Account Executive, Affiliate
+  BD, Associate General Counsel, Accounting Manager. Their only "skills" were
+  Sales, Security, Presentation or Excel. Zero is the *correct* answer for a
+  legal-counsel role, and `skills_unparsed` routes it to semantic-only scoring.
+* **49 of the 52 engineering-titled zeroes are Adzuna** — the 500-character
+  teaser again, not over-pruning. Greenhouse contributed 2, Lever 0.
+
+---
+
+## 29. First calibration against real data (326 jobs, 953 chunks)
+
+**Nothing was set.** COS_LO/COS_HI remain at the placeholder 0.45/0.85.
+
+### 29.1 Resume-to-chunk cosine
+
+```
+Per-chunk (raw)      n=953  min=0.4099  mean=0.5964  max=0.7940
+                     p5=0.5118  p25=0.5642  p50=0.5959  p75=0.6288  p95=0.6842
+
+Per-job top-3 mean   n=326  min=0.4983  mean=0.6100  max=0.7940
+                     p5=0.5322  p25=0.5818  p50=0.6043  p75=0.6389  p95=0.6911
+```
+
+The script suggests `COS_LO, COS_HI = 0.53, 0.69`. The band is **0.16 wide**,
+against the placeholder's 0.40 — the narrow-band problem from 16.3, now measured
+on a real corpus. This supersedes the 12-job synthetic measurement in 19.3
+(0.56/0.79): the embedding trim (21.4) replaced prose with nouns, so that
+earlier band is void, exactly as predicted.
+
+Every job produced exactly one chunk on Adzuna and few elsewhere, so the
+"top-3 mean" is close to a max in practice — worth knowing when reading the
+per-job row.
+
+### 29.2 Final overall_score
+
+```
+overall_score    n=326  min=0.0822  mean=0.3152  max=0.8750
+                 p5=0.1227  p25=0.1718  p50=0.3035  p75=0.4078  p95=0.6655
+
+semantic_score   n=326  min=0.1208  mean=0.4000  max=0.8600
+                 p5=0.2055  p25=0.3295  p50=0.3856  p75=0.4721  p95=0.6028
+
+skill_score      n=326  min=0.0000  mean=0.1373  max=1.0000
+                 p5=0.0000  p25=0.0000  p50=0.0000  p75=0.2000  p95=0.6667
+```
+
+`skill_score` has a **median of zero** — over half the corpus scores nothing on
+skills, because 115 jobs extract none and many others share nothing with this
+resume. 115 of 326 matches are `skills_unparsed` and therefore semantic-only.
+
+### 29.3 OPEN, and it should be settled before thresholds are frozen
+
+The ranking is wrong at both ends, and not because of the vocabulary.
+
+Top of the ranking, by `overall_score`:
+
+| score | sem | skill | title | matched |
+|---|---|---|---|---|
+| 0.7764 | 0.441 | **1.000** | Account Executive - Italy | **Git** |
+| 0.7326 | 0.331 | **1.000** | Logistics Manager | **SQL** |
+| 0.7318 | 0.330 | **1.000** | Accounting Manager | **SQL** |
+
+Bottom of the ranking: `SWE-3 Backend Engineer, ML Systems` at **0.0822**.
+
+Two mechanisms, both structural:
+
+1. **Weighted recall saturates on thin extraction.** `skill_component` is
+   `earned / possible`. A posting with exactly one parsed requirement that the
+   candidate happens to hold scores a perfect 1.0. An Accounting Manager needing
+   SQL therefore out-ranks most backend roles. This is the cost of the
+   recall-not-Jaccard decision (16.4), which is right in general and degenerate
+   when `possible` is 1.
+2. **`skills_unparsed` is a penalty in practice.** Semantic-only scoring lands
+   near the middle of a narrow band, so a genuine backend role whose Adzuna
+   teaser yielded no skills sinks below a sales role that matched one.
+
+Both were invisible until a real corpus existed. Reported, not acted on, as
+instructed. Likely fixes: a confidence floor on `possible` (a job with one
+parsed requirement should not be able to reach 1.0), and revisiting what
+`skills_unparsed` should contribute now that it affects a third of the corpus.

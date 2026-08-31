@@ -43,6 +43,30 @@ _JOB_TITLE_TAIL = re.compile(
 )
 
 
+#: Near-misses of blocklisted abstract competencies. The blocklist itself is an
+#: exact-match list, and no *pattern* safely separates this class from the terms
+#: that are kept — "design systems" is a category noun while "distributed
+#: systems" is a named practice, and they share a suffix. So the recurrence
+#: guard enumerates the common phrasings rather than guessing a rule, and the
+#: enumeration is small and explicit for exactly that reason.
+_ABSTRACT_ALIASES: frozenset[str] = frozenset(
+    {
+        "security", "application security", "information security", "infosec",
+        "observability", "monitoring", "agile", "agile methodology",
+        "agile methodologies", "scrum", "kanban", "sales", "presentation",
+        "presentation skills", "communication", "written communication",
+        "verbal communication", "technical writing", "accessibility",
+        "authentication", "authorization", "code review", "code reviews",
+        "incident response", "on call", "performance tuning",
+        "performance optimization", "api design", "data modelling",
+        "data modeling", "data pipelines", "data pipeline", "unit testing",
+        "unit tests", "web scraping", "scraping", "design systems",
+        "excel", "problem solving", "critical thinking", "attention to detail",
+        "time management", "stakeholder management", "cross functional",
+    }
+)
+
+
 @dataclass(frozen=True)
 class BlockedTerm:
     term: str
@@ -94,6 +118,8 @@ def is_disallowed(name: str) -> str | None:
         return "on the checked-in blocklist"
     if _JOB_TITLE_TAIL.search(cleaned):
         return "reads as a job title, not a skill"
+    if key in _ABSTRACT_ALIASES:
+        return "an abstract competency, not a named technology"
     return None
 
 

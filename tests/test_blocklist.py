@@ -71,11 +71,26 @@ class TestIsDisallowed:
     def test_real_skills_are_allowed(self, term: str) -> None:
         assert is_disallowed(term) is None
 
-    def test_the_four_borderline_terms_survive(self) -> None:
-        """distributed systems, Data Structures, Security and Agile were judged
-        genuine screenable competencies and deliberately kept."""
-        for term in ("distributed systems", "Data Structures", "Security", "Agile"):
+    def test_named_specific_practices_survive(self) -> None:
+        """The vocabulary is scoped to named technologies and *named specific*
+        practices. These two are specific enough to verify against a posting."""
+        for term in ("distributed systems", "Data Structures"):
             assert is_disallowed(term) is None, term
+
+    def test_abstract_competencies_are_refused(self) -> None:
+        """Security and Agile were kept as borderline in the first pass and
+        blocked in the second: with full-length descriptions, Security matched
+        75 jobs including 'Accountant II'. The data changed the answer."""
+        for term in ("Security", "Agile", "Observability", "Sales", "Excel"):
+            assert is_disallowed(term) is not None, term
+
+    def test_near_misses_of_blocked_terms_are_refused(self) -> None:
+        """The recurrence guard enumerates phrasings rather than pattern-
+        matching, because no pattern separates 'design systems' (category noun)
+        from 'distributed systems' (named practice)."""
+        for term in ("Application Security", "Agile Methodology", "monitoring",
+                     "presentation skills", "code reviews", "unit tests"):
+            assert is_disallowed(term) is not None, term
 
     def test_a_trailing_title_word_only_counts_at_the_end(self) -> None:
         """'Engineering Productivity Tooling' is a real area; only a *trailing*

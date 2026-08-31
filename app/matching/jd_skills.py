@@ -110,6 +110,23 @@ _PREFERRED_SET = {m.casefold() for m in _PREFERRED_MARKERS}
 # the surrounding text looks like a list of technologies rather than prose.
 _SHORT_NAMES: frozenset[str] = frozenset({"r", "go", "c", "c#", "c++", "d", "js"})
 
+# Longer names with the same problem: genuine, verifiable technologies whose
+# names are also ordinary English words. Blocklisting them would be wrong —
+# "does this posting require Apache Spark" is exactly the kind of question a
+# matcher *can* answer — so they go through the same evidence test as the short
+# names instead. Measured cause: "Spark" matched "Account Maintenance
+# Associate" via prose like "spark innovation".
+_AMBIGUOUS_NAMES: frozenset[str] = frozenset(
+    {
+        "spark", "vault", "envoy", "playwright", "jest", "express", "rails",
+        "oracle", "pandas", "cypress", "selenium", "swift", "dart", "helm",
+        "snowflake", "keras", "groovy", "perl", "ruby",
+    }
+)
+
+#: Every name that must prove it is in a technology list rather than in prose.
+_NEEDS_EVIDENCE: frozenset[str] = _SHORT_NAMES | _AMBIGUOUS_NAMES
+
 # Punctuation that means "this is an item in a list".
 _LIST_BEFORE = set(",;/|([{•-–—\n\t")
 _LIST_AFTER = set(",;/|)]}•\n\t")
@@ -351,7 +368,7 @@ def extract_skills(description: str | None, index: SkillIndex) -> list[JobSkillH
                 continue
             skill_id, name = entry
 
-            if surface.casefold() in _SHORT_NAMES and not _short_name_ok(
+            if surface.casefold() in _NEEDS_EVIDENCE and not _short_name_ok(
                 span, match.start(), match.end()
             ):
                 continue

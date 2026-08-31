@@ -49,7 +49,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "R": (),
     "MATLAB": (),
     "Perl": (),
-    "Bash": ("shell", "shell scripting", "sh"),
+    "Bash": ("shell scripting", "bash scripting"),
     "PowerShell": (),
     "SQL": (),
     "HTML": ("html5",),
@@ -63,7 +63,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "FastAPI": (),
     "Django": (),
     "Flask": (),
-    "Spring Boot": ("spring", "springboot"),
+    "Spring Boot": ("springboot",),
     "Express": ("expressjs", "express.js"),
     "NestJS": ("nest.js",),
     "Rails": ("ruby on rails", "ror"),
@@ -71,7 +71,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     ".NET": ("dotnet", "asp.net", ".net core"),
     "gRPC": (),
     "GraphQL": (),
-    "REST APIs": ("rest", "restful", "rest api"),
+    "REST APIs": ("restful", "rest api", "restful api"),
     "Celery": (),
     "RabbitMQ": (),
     # --- frontend ----------------------------------------------------------
@@ -83,7 +83,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "Redux": (),
     "Tailwind CSS": ("tailwind",),
     "Webpack": (),
-    "Node.js": ("node", "nodejs"),
+    "Node.js": ("nodejs",),
     "jQuery": (),
     # --- data stores -------------------------------------------------------
     "PostgreSQL": ("postgres", "psql", "postgresql"),
@@ -113,13 +113,13 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "pandas": (),
     "NumPy": ("numpy",),
     "scikit-learn": ("sklearn", "scikit learn"),
-    "PyTorch": ("torch",),
+    "PyTorch": (),
     "TensorFlow": ("tensor flow",),
     "Keras": (),
     "Machine Learning": ("ml",),
     "Deep Learning": (),
     "NLP": ("natural language processing",),
-    "Computer Vision": ("cv",),
+    "Computer Vision": (),
     "LLM": ("llms", "large language models"),
     "RAG": ("retrieval augmented generation",),
     "Tableau": (),
@@ -133,7 +133,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "AWS": ("amazon web services",),
     "Azure": ("microsoft azure",),
     "GCP": ("google cloud", "google cloud platform"),
-    "Linux": ("unix",),
+    "Linux": (),
     "Nginx": (),
     "Jenkins": (),
     "GitHub Actions": (),
@@ -144,7 +144,7 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "Datadog": (),
     "OpenTelemetry": ("otel",),
     "Helm": (),
-    "Serverless": ("lambda", "aws lambda"),
+    "Serverless": ("aws lambda",),
     "Microservices": ("micro services",),
     "Git": (),
     "Vault": ("hashicorp vault",),
@@ -170,12 +170,12 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "Performance Tuning": ("performance optimization", "query tuning"),
     "Code Review": ("code reviews",),
     "Technical Writing": (),
-    "Incident Response": ("on-call", "on call"),
-    "Observability": ("monitoring",),
+    "Incident Response": (),
+    "Observability": (),
     "Security": ("appsec", "application security"),
     "OAuth": ("oauth2",),
     "JWT": (),
-    "Web Scraping": ("scraping",),
+    "Web Scraping": (),
     "ETL": ("elt",),
     "Data Pipelines": ("data pipeline",),
     "API Design": (),
@@ -185,6 +185,42 @@ SEED_SKILLS: dict[str, tuple[str, ...]] = {
     "Figma": (),
     "Jira": (),
     "Excel": ("microsoft excel", "ms excel"),
+}
+
+
+
+#: Aliases deliberately NOT used, and why. Audited 2026-08-31 after
+#: `monitoring` -> Observability was found matching accountancy roles.
+#:
+#: The rule: an alias must be an abbreviation ("k8s") or a spelling variant
+#: ("postgres", "nodejs") of the canonical term. It must not be an ordinary
+#: English word that merely co-occurs with it.
+#:
+#:   monitoring -> Observability   ordinary word; matched "Accountant II"
+#:   shell, sh  -> Bash            ordinary word; "shell company", "she"
+#:   spring     -> Spring Boot     the season
+#:   rest       -> REST APIs       "the rest of the team"
+#:   node       -> Node.js         "node in the graph"
+#:   torch      -> PyTorch         ordinary word
+#:   cv         -> Computer Vision curriculum vitae — in *job postings*
+#:   lambda     -> Serverless      Python keyword, mathematical term
+#:   on-call    -> Incident Response  prose in most engineering postings
+#:   scraping   -> Web Scraping     ordinary word
+#:   unix       -> Linux            a different OS, not an alias
+REJECTED_ALIASES: dict[str, str] = {
+    "monitoring": "Observability",
+    "shell": "Bash",
+    "sh": "Bash",
+    "spring": "Spring Boot",
+    "rest": "REST APIs",
+    "node": "Node.js",
+    "torch": "PyTorch",
+    "cv": "Computer Vision",
+    "lambda": "Serverless",
+    "on-call": "Incident Response",
+    "on call": "Incident Response",
+    "scraping": "Web Scraping",
+    "unix": "Linux",
 }
 
 

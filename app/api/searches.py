@@ -75,6 +75,9 @@ class MatchOut(BaseModel):
     #: is a very different claim from 1.0 at parsed_count 9.
     parsed_count: int | None = None
     skills_unparsed: bool = False
+    #: "strong" | "moderate" | "weak" from fixed absolute cutoffs, not
+    #: per-search percentiles — a tier means the same thing across searches.
+    tier: str | None = None
     matching_skills: list[str] = Field(default_factory=list)
     missing_skills: list[str] = Field(default_factory=list)
     explanation: str | None
@@ -307,6 +310,7 @@ def _to_match_out(match: Match, job: Job) -> MatchOut:
         skill_confidence=match.skill_confidence,
         parsed_count=match.parsed_count,
         skills_unparsed=match.skills_unparsed,
+        tier=match.tier,
         matching_skills=list(match.matching_skills or []),
         missing_skills=list(match.missing_skills or []),
         explanation=match.explanation,

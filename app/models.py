@@ -302,6 +302,12 @@ class Match(Base):
     )
     #: How many requirements were parsed for the job.
     parsed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "strong" | "moderate" | "weak", from the frozen absolute cutoffs in
+    # scorer.TIER_STRONG / TIER_MODERATE. Stored rather than computed on read so
+    # a threshold change is visible as a re-score rather than silently
+    # relabelling history. Free text for the same reason as the other label
+    # columns (2.8).
+    tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
     #: True when the job had no readable requirements at all. These are ranked
     #: in their own bucket by GET /matches, not interleaved — see DECISIONS 30.2.
     skills_unparsed: Mapped[bool] = mapped_column(

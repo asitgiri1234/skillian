@@ -42,17 +42,45 @@ SKILL_WEIGHTS: dict[str, float] = {"required": 1.0, "preferred": 0.4}
 #: it catches named technologies and misses everything phrased as a sentence.
 W_SKILL, W_SEMANTIC = 0.6, 0.4
 
-#: Cosine rescaling bounds. **These are placeholders and are known to be wrong.**
-#: Embeddings of related English text do not use the [0, 1] range: in practice
-#: every resume-to-job-chunk cosine lands in a narrow band, so an unrescaled
-#: semantic score barely varies between the best and worst job in a result set
-#: and contributes far less spread than its 40% weight implies. Rescaling
-#: stretches the observed band back across [0, 1].
+#: Cosine rescaling bounds. **Frozen 2026-08-31 from measured data**, replacing
+#: the placeholders that stood since day 3.
 #:
-#: Run ``python scripts/calibrate_similarity.py --resume-id <id>`` against real
-#: ingested jobs and set COS_LO to roughly the 5th percentile and COS_HI to
-#: roughly the 95th of the printed distribution. See DECISIONS 16.3.
-COS_LO, COS_HI = 0.45, 0.85
+#: Embeddings of related English text do not use the [0, 1] range: every
+#: resume-to-job-chunk cosine lands in a narrow band, so an unrescaled semantic
+#: score barely varies between the best and worst job and contributes far less
+#: spread than its 40% weight implies. Rescaling stretches the observed band
+#: back across [0, 1].
+#:
+#: Measured over 326 real postings / 953 chunks, per-job top-3 mean:
+#:     min 0.4983  p5 0.5322  p50 0.6043  p95 0.6911  max 0.7940
+#: p5 and p95 rounded to two places. The band is 0.16 wide — a quarter of the
+#: 0.40 the placeholder assumed. See DECISIONS 31.1.
+#:
+#: Re-derive with ``python scripts/calibrate_similarity.py --resume-id <id>``
+#: whenever the embedding model or the resume embedding text changes; both move
+#: this band, and a stale band silently flattens the semantic component.
+COS_LO, COS_HI = 0.53, 0.69
+
+#: Cutoffs for the ``tier`` label on a match. **Fixed absolutes, not per-search
+#: percentiles** — a tier must mean the same thing across two different searches
+#: and two different resumes, and a percentile would relabel the same job
+#: differently depending on what it was fetched alongside.
+#:
+#: Measured over the 211 ranked matches: p50 0.2292, p75 0.3601, p95 0.5431.
+#: See DECISIONS 31.2 for why `moderate` sits above the median.
+TIER_STRONG = 0.36
+TIER_MODERATE = 0.25
+
+TIER_LABELS = ("strong", "moderate", "weak")
+
+
+def tier_for(overall_score: float) -> str:
+    """Bucket a score into strong / moderate / weak."""
+    if overall_score >= TIER_STRONG:
+        return "strong"
+    if overall_score >= TIER_MODERATE:
+        return "moderate"
+    return "weak"
 
 #: How many chunks contribute to the semantic score. See semantic_component.
 TOP_K_CHUNKS = 3
@@ -71,7 +99,9 @@ SKILL_CONFIDENCE_FULL = 6
 #: Stamped onto matches.model_version so a scoring change can invalidate old
 #: rows selectively instead of truncating the table. Bump it when a weight,
 #: a bound, or the formula changes.
-SCORER_VERSION = "skillian-scorer-1"
+# Bumped when a weight, a bound or the formula changes. -2: evidence-weighted
+# skill component, and COS_LO/COS_HI frozen from measured data.
+SCORER_VERSION = "skillian-scorer-2"
 
 # Free-text requirement labels seen in the wild, folded onto the two levels
 # SKILL_WEIGHTS knows about. job_skills.requirement is a free-text column by
@@ -181,6 +211,22 @@ class ScoreResult:
     #: an unweighted semantic score as if it were a full match is a lie.
     skills_unparsed: bool = False
     experience_multiplier: float = 1.0
+
+    @property
+    def tier(self) -> str | None:
+        """strong / moderate / weak — or **None when requirements were not read**.
+
+        A tier is a judgement about a match whose requirements we could see. An
+        unparsed job's ``overall_score`` is a bare rescaled cosine, so labelling
+        it "strong" would assert something the data cannot support: the highest
+        semantic-only score in the corpus belongs to a 2019 posting whose
+        description is boilerplate. Same reasoning as the bucket split in
+        DECISIONS 30.2 — these are not the same measurement, so they do not
+        share a vocabulary either.
+        """
+        if self.skills_unparsed:
+            return None
+        return tier_for(self.overall_score)
 
 
 # --- components -------------------------------------------------------------

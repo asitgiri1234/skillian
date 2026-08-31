@@ -177,9 +177,12 @@ class TestSemanticComponent:
 
     def test_single_chunk_is_just_that_chunk(self) -> None:
         resume = [1.0, 0.0]
-        # cos = 1/sqrt(2) ~= 0.7071, inside [COS_LO, COS_HI].
-        expected = (1 / math.sqrt(2) - COS_LO) / (COS_HI - COS_LO)
-        assert semantic_component(resume, [[1.0, 1.0]]) == pytest.approx(expected)
+        # [1, 1.333] gives cos ~= 0.600, inside the measured [0.53, 0.69] band.
+        chunk = [1.0, 1.333]
+        raw = cosine_similarity(resume, chunk)
+        assert COS_LO < raw < COS_HI, "fixture must sit inside the band"
+        expected = (raw - COS_LO) / (COS_HI - COS_LO)
+        assert semantic_component(resume, [chunk]) == pytest.approx(expected)
 
     def test_two_chunks_average_both(self) -> None:
         resume = [1.0, 0.0]
@@ -221,12 +224,14 @@ class TestSemanticComponent:
     def test_rescaling_stretches_the_observed_band(self) -> None:
         """The reason rescaling exists: a small raw gap becomes a usable one."""
         resume = [1.0, 0.0]
-        # Two vectors whose raw cosines differ by ~0.09 within the band.
-        near = [1.0, 0.55]   # cos ~= 0.8761
-        far = [1.0, 0.75]    # cos ~= 0.8
+        # Two vectors inside the measured [0.53, 0.69] band: cos ~0.65 and ~0.60.
+        near = [1.0, 1.169]
+        far = [1.0, 1.333]
         raw_gap = cosine_similarity(resume, near) - cosine_similarity(resume, far)
         scaled_gap = semantic_component(resume, [near]) - semantic_component(resume, [far])
-        assert scaled_gap > raw_gap
+        assert 0 < raw_gap < scaled_gap, (
+            "a 0.16-wide band should magnify a small raw gap several times over"
+        )
 
 
 # --- experience_multiplier --------------------------------------------------
@@ -453,3 +458,54 @@ class TestSkillConfidence:
         assert result.skills_unparsed is True
         assert result.skill_confidence == 0.0
         assert result.parsed_count == 0
+
+
+# --- frozen thresholds ------------------------------------------------------
+
+
+class TestFrozenThresholds:
+    """These values are frozen from measured data, not guesses. A test that
+    pins them is what makes an accidental edit visible in review."""
+
+    def test_cosine_band_matches_the_measured_percentiles(self) -> None:
+        # p5 0.5322 / p95 0.6911 over 326 postings, rounded to two places.
+        assert (scorer.COS_LO, scorer.COS_HI) == (0.53, 0.69)
+
+    def test_tier_cutoffs(self) -> None:
+        assert (scorer.TIER_STRONG, scorer.TIER_MODERATE) == (0.36, 0.25)
+
+    @pytest.mark.parametrize(
+        ("score_value", "expected"),
+        [
+            (1.0, "strong"), (0.36, "strong"), (0.3599, "moderate"),
+            (0.25, "moderate"), (0.2499, "weak"), (0.0, "weak"),
+        ],
+    )
+    def test_tier_boundaries_are_inclusive_below(self, score_value, expected) -> None:
+        assert scorer.tier_for(score_value) == expected
+
+    def test_unparsed_matches_have_no_tier(self) -> None:
+        """A tier is a judgement about a match whose requirements were read. The
+        highest semantic-only score in the corpus belongs to a 2019 posting made
+        of boilerplate; calling it "strong" would assert what the data cannot."""
+        unparsed = score(
+            ResumeProfile(resume_id=uuid.uuid4(), embedding=[1.0, 0.0]),
+            JobPosting(job_id=uuid.uuid4(), skills=(), chunk_embeddings=([1.0, 0.0],)),
+        )
+        assert unparsed.skills_unparsed is True
+        assert unparsed.overall_score > scorer.TIER_STRONG
+        assert unparsed.tier is None
+
+    def test_a_ranked_match_does_get_a_tier(self) -> None:
+        python = _skill("Python")
+        ranked = score(
+            ResumeProfile(
+                resume_id=uuid.uuid4(),
+                embedding=[1.0, 0.0],
+                skill_ids=frozenset({python.skill_id}),
+            ),
+            JobPosting(
+                job_id=uuid.uuid4(), skills=(python,), chunk_embeddings=([1.0, 0.0],)
+            ),
+        )
+        assert ranked.tier in scorer.TIER_LABELS

@@ -2415,3 +2415,128 @@ segregated rather than polluting the ranking.
 The better fix, if Adzuna is to stay first-class, is to follow `apply_url` and
 fetch the full posting. That is a scraping change with its own failure modes and
 belongs in its own pass.
+
+---
+
+# Decisions — Day 3h (thresholds frozen)
+
+## 31. Frozen values
+
+### 31.1 `COS_LO = 0.53`, `COS_HI = 0.69`
+
+From the measured per-job top-3-mean cosine over 326 postings / 953 chunks:
+
+```
+min 0.4983   p5 0.5322   p25 0.5818   p50 0.6043   p75 0.6389   p95 0.6911   max 0.7940
+```
+
+p5 and p95 rounded to two places. This replaces the placeholder 0.45/0.85 that
+stood since day 3 and was never anything but a guess.
+
+**The band is 0.16 wide, against the 0.40 the placeholder assumed.** That is the
+narrow-band problem of 16.3, finally quantified: the worst match in the corpus
+(a backend résumé against a Japanese-language solutions-architect posting) still
+scores 0.4983, and the best scores 0.7940. Rescaling that 0.16 onto [0, 1] is
+what makes the semantic component contribute the spread its 40% weight implies.
+
+Re-derive whenever the embedding model or `build_resume_embedding_text` changes.
+Both move the band, and a stale band silently flattens the component — the
+day-3b trim (21.4) already invalidated one earlier measurement this way.
+
+### 31.2 `TIER_STRONG = 0.36`, `TIER_MODERATE = 0.25`
+
+**Fixed absolutes, not per-search percentiles.** A tier must mean the same thing
+across two searches and two résumés; a percentile would relabel the same job
+differently depending on what it happened to be fetched alongside.
+
+`strong = 0.36` is the p75 of `overall_score` across the 211 ranked matches.
+`moderate = 0.25` sits deliberately **above** the measured p50 of 0.2292.
+
+### 31.3 The band above 0.25 was checked before the line was drawn
+
+The stated rationale for lifting `moderate` above the median was that the median
+is "where the corpus turns from Python roles into sales and marketing jobs that
+happen to match one technology". The five matches immediately above 0.25 do look
+that way — three of them are Account Development Representatives matching AWS:
+
+```
+0.2564 skill=0.183 sem=0.367 n=5  Applied Scientist III            Python
+0.2562 skill=0.183 sem=0.367 n=5  Account Development Rep          AWS
+0.2512 skill=0.183 sem=0.354 n=5  Account Development Rep          AWS
+0.2512 skill=0.183 sem=0.354 n=5  Account Development Rep          AWS
+0.2509 skill=0.000 sem=0.627 n=5  Backend Engineer                 (none)
+-- 0.25 --
+0.2476 skill=0.135 sem=0.417 n=11 Engineering Manager              Redis,Kubernetes
+0.2444 skill=0.140 sem=0.400 n=5  Account Executive, Majors        AWS
+0.2434 skill=0.167 sem=0.359 n=6  Principal Software Engineer      Python
+```
+
+**But that five-row window is not representative, and the aggregate refutes the
+premise.** Engineering-titled share by band:
+
+| band | n | eng | sales | eng% |
+|---|---|---|---|---|
+| >= 0.40 | 33 | 26 | 1 | 79% |
+| 0.36-0.40 | 21 | 10 | 3 | 48% |
+| 0.30-0.36 | 27 | 18 | 0 | 67% |
+| **0.25-0.30** | 17 | 11 | 4 | **65%** |
+| 0.20-0.25 | 21 | 13 | 2 | 62% |
+| 0.15-0.20 | 36 | 14 | 12 | 39% |
+| < 0.15 | 56 | 6 | 26 | **11%** |
+
+Composition is **flat at 65-67% engineering from 0.20 all the way to 0.36**. The
+corpus does not turn at the median; it turns at **0.20**, below which the
+engineering share collapses to 39% and then 11%.
+
+So the "band above 0.25 is visibly non-technical" condition does **not** hold —
+the band is 65% technical, and the unrepresentative window straddling the cutoff
+was a sampling artefact. 0.25 was applied as specified. Recorded because the
+*reasoning* behind it does not survive contact with the aggregate, even though
+the number is fine: no line between 0.20 and 0.36 changes composition, so 0.25
+is neither better nor worse than its neighbours on that criterion. If the intent
+is specifically to sit at the composition boundary, the measured answer is 0.20.
+
+### 31.4 Freezing the cosine band moved the score distribution
+
+Worth stating because it is easy to miss: the tier cutoffs were derived from an
+`overall_score` distribution computed with the **old placeholder** cosine
+bounds. Freezing 0.53/0.69 rescaled every semantic score, and therefore every
+overall score:
+
+| | before freeze | after freeze |
+|---|---|---|
+| p50 | 0.2292 | 0.2878 |
+| p75 | 0.3601 | 0.4398 |
+| p95 | 0.5431 | 0.6796 |
+
+`strong = 0.36` was the old p75; against the new distribution it is closer to
+the p60. The tier sizes remain healthy, so the values stand as frozen — but
+anyone re-deriving thresholds must re-measure *after* fixing the cosine band,
+not before.
+
+### 31.5 Resulting distribution
+
+211 ranked matches:
+
+| tier | n | share |
+|---|---|---|
+| strong | 78 | 37.0% |
+| moderate | 44 | 20.9% |
+| weak | 89 | 42.2% |
+
+No tier is under 5% or over 70%.
+
+### 31.6 Unparsed matches carry no tier
+
+Found while dumping the API shapes: an unparsed match was being labelled
+`tier: "strong"` — the top of that bucket is a 2019 posting whose entire
+description is boilerplate, scoring 0.9986 on semantics alone.
+
+`ScoreResult.tier` now returns `None` when `skills_unparsed`. Same reasoning as
+the bucket split in 30.2: an unparsed score is a bare rescaled cosine, not a
+blend, so it does not share a vocabulary with ranked matches. Labelling one
+"strong" asserts something the data cannot support, and it would have been baked
+into the frontend contract.
+
+`SCORER_VERSION` bumped to `skillian-scorer-2`, so matches scored under the old
+weights and bounds are distinguishable in the table rather than silently mixed.

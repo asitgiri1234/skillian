@@ -197,6 +197,67 @@ class ParsedResume(BaseModel):
         return self
 
 
+def build_resume_embedding_text(parsed: "ParsedResume | dict[str, Any]") -> str:
+    """The text a resume's embedding is built from: skills and experience only.
+
+    Deliberately **not** ``raw_text``. A resume's raw text is mostly things that
+    say nothing about employability — a postal address, a phone number, hobbies,
+    "References available on request", the name of a school. Those tokens are a
+    large fraction of the document and they pull every candidate's vector toward
+    the same generic-CV centroid, which compresses the range of resume-to-job
+    cosines and makes the semantic component nearly constant across jobs.
+
+    Education is excluded for the same reason: a degree title matches every
+    posting's boilerplate degree requirement about equally, so it adds distance
+    to no one. Skills and what the candidate actually *did* are the signal.
+
+    Accepts either a :class:`ParsedResume` or the JSONB dict read back from
+    ``resumes.parsed``, so the API can call it without a re-validation round
+    trip through pydantic.
+
+    Returns "" when there is nothing usable; the caller must not embed that
+    (the provider rejects empty text, deliberately).
+    """
+    if isinstance(parsed, ParsedResume):
+        data = parsed.model_dump()
+    else:
+        data = parsed or {}
+
+    sections: list[str] = []
+
+    skills = [str(s).strip() for s in (data.get("skills") or []) if str(s).strip()]
+    if skills:
+        # Comma-joined under a heading rather than one per line: the embedding
+        # model reads prose, and a bare newline-separated list of nouns embeds
+        # further from a job description's prose than the same list inline.
+        sections.append("Skills: " + ", ".join(skills))
+
+    role_lines: list[str] = []
+    for entry in data.get("experience") or []:
+        if not isinstance(entry, dict):
+            continue
+        # Title and company describe the role; the summary describes the work.
+        # Dates are dropped — "Jan 2020 - Present" is noise under cosine.
+        headline = " at ".join(
+            part for part in (entry.get("title"), entry.get("company")) if part
+        )
+        summary = (entry.get("summary") or "").strip()
+        line = ". ".join(part for part in (headline, summary) if part)
+        if line:
+            role_lines.append(line)
+    if role_lines:
+        sections.append("Experience:\n" + "\n".join(role_lines))
+
+    # The professional summary is the candidate's own description of their work,
+    # so it belongs with experience. Included last: it is often absent, and when
+    # present it is the most boilerplate-prone field on the page.
+    summary = (data.get("summary") or "").strip()
+    if summary:
+        sections.append("Summary: " + summary)
+
+    return "\n\n".join(sections).strip()
+
+
 class StructureError(RuntimeError):
     """Extraction failed validation on every attempt."""
 

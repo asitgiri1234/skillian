@@ -44,13 +44,19 @@ class OllamaLLMProvider(LLMProvider):
             timeout=self._settings.ollama_timeout_seconds,
         )
 
-    def complete(
+    def _chat(
         self,
         prompt: str,
-        schema: type[BaseModel],
-        *,
-        system: str | None = None,
-    ) -> dict[str, Any]:
+        system: str | None,
+        options: dict[str, Any],
+        response_format: dict[str, Any] | None,
+    ) -> str:
+        """One chat round-trip, with Ollama's failure modes mapped to ours.
+
+        Shared by :meth:`complete` and :meth:`complete_text` so the error
+        translation below — which is the part that took experimentation to get
+        right — exists once.
+        """
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -60,17 +66,8 @@ class OllamaLLMProvider(LLMProvider):
             response = self._client.chat(
                 model=self.model,
                 messages=messages,
-                # The schema constrains decoding at the token level. This is
-                # strictly stronger than asking for JSON in the prompt: malformed
-                # or extra-key output becomes unrepresentable rather than
-                # merely discouraged.
-                format=schema.model_json_schema(),
-                options={
-                    # Extraction is not a creative task — the same resume must
-                    # produce the same parse, or the retry loop below and any
-                    # cached result become meaningless.
-                    "temperature": 0,
-                },
+                format=response_format,
+                options=options,
             )
         except ollama.ResponseError as exc:
             # 404 here means the model was never pulled, which is by far the most
@@ -80,6 +77,18 @@ class OllamaLLMProvider(LLMProvider):
                     f"Ollama has no model {self.model!r}. Run: ollama pull {self.model}"
                 ) from exc
             raise LLMUnavailableError(f"Ollama error: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            # Checked before TransportError, which it subclasses. A timeout is
+            # NOT an unreachable daemon, and conflating them costs real time:
+            # a 7b model reading a full resume measured 170s here against the
+            # 180s default, so the first thing a slow machine sees is a message
+            # telling it to start a daemon that is already running.
+            raise LLMUnavailableError(
+                f"Ollama did not respond within "
+                f"{self._settings.ollama_timeout_seconds:g}s (model {self.model!r}). "
+                "The daemon is reachable; it is just slow. Raise "
+                "OLLAMA_TIMEOUT_SECONDS in .env, or use a smaller model."
+            ) from exc
         except (httpx.TransportError, ConnectionError) as exc:
             raise LLMUnavailableError(
                 f"Cannot reach the Ollama daemon at {self._settings.ollama_host}. "
@@ -89,6 +98,30 @@ class OllamaLLMProvider(LLMProvider):
         content = response.message.content
         if not content:
             raise LLMResponseError("Ollama returned an empty message")
+        return content
+
+    def complete(
+        self,
+        prompt: str,
+        schema: type[BaseModel],
+        *,
+        system: str | None = None,
+    ) -> dict[str, Any]:
+        content = self._chat(
+            prompt,
+            system,
+            options={
+                # Extraction is not a creative task — the same resume must
+                # produce the same parse, or the retry loop above it and any
+                # cached result become meaningless.
+                "temperature": 0,
+            },
+            # The schema constrains decoding at the token level. This is strictly
+            # stronger than asking for JSON in the prompt: malformed or
+            # extra-key output becomes unrepresentable rather than merely
+            # discouraged.
+            response_format=schema.model_json_schema(),
+        )
 
         try:
             data = json.loads(content)
@@ -105,3 +138,19 @@ class OllamaLLMProvider(LLMProvider):
                 f"Expected a JSON object, got {type(data).__name__}"
             )
         return data
+
+    def complete_text(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
+        options: dict[str, Any] = {"temperature": temperature}
+        if max_tokens is not None:
+            # Ollama spells the output cap "num_predict", not "max_tokens".
+            options["num_predict"] = max_tokens
+        # format=None: unconstrained decoding. Passing a schema here would make
+        # the model emit JSON punctuation for text a human reads directly.
+        return self._chat(prompt, system, options=options, response_format=None).strip()

@@ -21,19 +21,35 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import SessionLocal
 from app.models import IngestionRun, Job
+
+# Written to ingestion_runs.status. app.runs now owns this vocabulary (and the
+# search pipeline's); the names stay importable from here so day-1 callers and
+# tests are unaffected.
+from app.runs import (
+    STATUS_FAILED,
+    STATUS_PARTIAL,
+    STATUS_RUNNING,
+    STATUS_SUCCESS,
+)
 from app.sources.base import JobSource, NormalizedJob, SearchQuery
 
 logger = logging.getLogger(__name__)
 
-# Written to ingestion_runs.status.
-STATUS_RUNNING = "running"
-STATUS_SUCCESS = "success"
-STATUS_PARTIAL = "partial"
-STATUS_FAILED = "failed"
+__all__ = [
+    "STATUS_FAILED",
+    "STATUS_PARTIAL",
+    "STATUS_RUNNING",
+    "STATUS_SUCCESS",
+    "IngestionResult",
+    "StoredJob",
+    "run_ingestion",
+    "upsert_job",
+]
 
 # Columns refreshed when a job we already have comes back from a source.
-# Deliberately excludes id, source, source_job_id (identity) and embedding — an
-# embedding costs an API call, so a re-fetch must not null it out.
+# Deliberately excludes id, source and source_job_id (identity). Chunk
+# embeddings live in job_chunks and are keyed on job_id, so a refresh here
+# leaves them alone; the pipeline re-chunks only jobs that have none.
 _UPSERT_FIELDS: tuple[str, ...] = (
     "dedup_hash", "title", "company", "location", "is_remote", "description",
     "apply_url", "salary_raw", "salary_min", "salary_max", "salary_currency",
@@ -100,7 +116,7 @@ def _create_run(
     return run
 
 
-def _upsert_job(session: Session, job: NormalizedJob) -> StoredJob:
+def upsert_job(session: Session, job: NormalizedJob) -> StoredJob:
     """Insert or refresh one job, keyed on (source, source_job_id).
 
     Uses INSERT ... ON CONFLICT DO UPDATE rather than SELECT-then-INSERT: a single
@@ -219,7 +235,7 @@ def run_ingestion(
 
             logger.info("Source %s returned %s jobs", source.name, len(fetched))
             for job in fetched:
-                result.stored.append(_upsert_job(session, job))
+                result.stored.append(upsert_job(session, job))
 
         result.jobs_found = len(result.stored)
         # Commit the jobs before touching the run row so a failure while

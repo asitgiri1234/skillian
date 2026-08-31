@@ -61,8 +61,10 @@ class Settings(BaseSettings):
     ollama_llm_model: str = "qwen2.5:7b"
     # 768-dimensional. Must agree with models.EMBEDDING_DIM.
     ollama_embed_model: str = "nomic-embed-text"
-    # A 7b model on CPU can take well over a minute for a long resume.
-    ollama_timeout_seconds: float = 180.0
+    # A 7b model on CPU can take well over a minute for a long resume — measured
+    # at 170s here, which made the previous 180s default a coin flip. Raised to
+    # 300 after a verification run timed out mid-extraction.
+    ollama_timeout_seconds: float = 300.0
 
     # --- Extraction -------------------------------------------------------
     # Attempts for the validate-and-retry loop in app/structure.py. Constrained

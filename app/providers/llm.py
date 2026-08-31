@@ -60,3 +60,29 @@ class LLMProvider(ABC):
             LLMResponseError: reply could not be decoded as a JSON object.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def complete_text(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Return a free-text completion, with no schema constraining decoding.
+
+        Added on day 3 for match explanations, which are prose read by a human.
+        Forcing them through :meth:`complete` with a one-field wrapper schema
+        would constrain the decoder for no benefit and make the model spend
+        tokens on JSON punctuation.
+
+        Abstract rather than a default implemented in terms of ``complete``:
+        every real backend has a plain completion call, and a default would let
+        a provider silently inherit a worse one.
+
+        Raises:
+            LLMUnavailableError: backend unreachable or model missing.
+            LLMResponseError: the reply was empty.
+        """
+        raise NotImplementedError

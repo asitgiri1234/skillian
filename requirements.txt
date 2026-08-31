@@ -23,3 +23,7 @@ pydantic-settings>=2.7,<3.0
 # Local LLM + embeddings. Pinned minor: the structured-output `format=` parameter
 # on chat() landed in 0.4 and is the whole basis of the extraction path.
 ollama>=0.4,<1.0
+
+# Tests. Day 3 finally commits the suite the previous two days kept in scratch
+# scripts; httpx's ASGI transport is what TestClient uses under the hood.
+pytest>=8.3,<9.0

@@ -1,20 +1,44 @@
-"""FastAPI application object.
+"""FastAPI application object and router wiring.
 
-Structure only on day 1: the app exists so deployment, settings wiring and the
-import graph are established, but no routes are defined yet. Endpoints arrive
-once there is something to serve.
+Day 1 declared this module with no routes, by instruction. Day 3 mounts the two
+routers the search flow needs. There is still no auth, no rate limiting and no
+CORS configuration — see DECISIONS 18.8 for what that means before this is
+exposed to anything but localhost.
 """
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 
+from app.api import resumes, searches
 from app.config import get_settings
 
 settings = get_settings()
 
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+
 app = FastAPI(
     title="Skillian",
     description="Job scraper and resume matcher.",
-    version="0.1.0",
+    version="0.3.0",
 )
+
+app.include_router(resumes.router)
+app.include_router(searches.router)
+
+
+@app.get("/health", tags=["ops"])
+def health() -> dict[str, str]:
+    """Liveness only.
+
+    Deliberately does not touch Postgres or Ollama. A health check that fails
+    when a dependency is down turns one outage into a restart loop; the run row
+    and the 503s from the resume endpoints are where dependency failures should
+    surface, with a message naming the fix.
+    """
+    return {"status": "ok", "version": app.version}

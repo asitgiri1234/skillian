@@ -58,6 +58,17 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
                     f"Ollama has no model {self.model!r}. Run: ollama pull {self.model}"
                 ) from exc
             raise EmbeddingUnavailableError(f"Ollama error: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            # Before TransportError, which it subclasses — see the note in
+            # ollama_llm._chat. Embedding is fast, so a timeout here usually
+            # means an oversized batch rather than a slow machine.
+            raise EmbeddingUnavailableError(
+                f"Ollama did not respond within "
+                f"{self._settings.ollama_timeout_seconds:g}s while embedding "
+                f"{len(texts)} text(s). The daemon is reachable; it is just "
+                "slow. Raise OLLAMA_TIMEOUT_SECONDS in .env, or reduce "
+                "EMBED_BATCH_SIZE."
+            ) from exc
         except (httpx.TransportError, ConnectionError) as exc:
             raise EmbeddingUnavailableError(
                 f"Cannot reach the Ollama daemon at {self._settings.ollama_host}. "

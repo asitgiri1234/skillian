@@ -766,3 +766,538 @@ scripts. This is now two days of accumulated verification living outside the
 repo, and the case for promoting it to `tests/` is stronger than it was
 yesterday — the provider fakes and the retry-loop fixtures are exactly what
 would be expensive to reconstruct later.
+
+---
+
+# Decisions — Day 3 (matching pipeline and async search)
+
+Schema for chunk-level embeddings, the scorer, the eight-stage search pipeline,
+background execution and the HTTP surface. The two questions this day is
+organised around: *where is it legitimate to spend a local-model call*, and
+*what does a score mean when the inputs are missing*.
+
+---
+
+## 15. Schema changes
+
+### 15.1 `jobs.embedding` dropped; `job_chunks` replaces it
+
+- **Why:** a job description is several documents stapled together — a company
+  blurb, responsibilities, hard requirements, nice-to-haves, benefits, and an
+  equal-opportunity paragraph that is word-for-word identical across thousands
+  of postings. One vector over all of it is dominated by whichever section is
+  longest, which is almost never the one a candidate should be matched on.
+  Worse, the shared boilerplate pulls every posting toward the same centroid, so
+  a payments backend role and a QA role end up closer to each other than either
+  is to a resume.
+- Chunking lets the strongest *passage* speak for the job, which is what
+  `semantic_component`'s top-3 mean consumes.
+- **No data migration.** An existing `jobs.embedding` cannot be split into chunk
+  vectors after the fact — the chunk text it would have belonged to was never
+  stored. Affected jobs are simply re-chunked on the next search, which the
+  pipeline already does for any job with no `job_chunks` rows. The downgrade is
+  symmetric and equally lossy, and says so.
+
+### 15.2 `job_chunks.embedding` is NOT NULL, unlike `resumes.embedding`
+
+- **Why:** a resume genuinely exists before it is embedded — it is created by an
+  upload and embedded afterwards. A chunk has no such state: chunking and
+  embedding happen in the same pipeline stage, and a chunk row is only ever
+  written because it was embedded. A nullable column would invent a state the
+  code cannot produce, and every reader would then have to handle it.
+
+### 15.3 `UNIQUE(job_id, chunk_index)` rather than just an index
+
+- **Why:** it makes re-chunking idempotent. The pipeline can `ON CONFLICT DO
+  NOTHING` a whole batch without first deleting, so a run that dies partway
+  through stage e and is retried rewrites nothing and duplicates nothing.
+
+### 15.4 `ingestion_runs.stage` is free text, not an enum
+
+- Consistent with 2.8. `status="running"` on its own tells a polling client
+  nothing about whether to keep waiting; `stage` is what turns a four-minute
+  blank wait into visible progress.
+- The ordered `STAGE_ORDER` tuple in `app/runs.py` is what makes it renderable
+  as "step 4 of 10" without every client hardcoding the list.
+
+### 15.5 No ANN index on `job_chunks.embedding`
+
+- **Why:** nothing does a nearest-neighbour *query*. Scoring loads the chunk
+  vectors for the jobs a run already fetched and compares them in Python, which
+  is the right shape when the candidate set is a few hundred rows the pipeline
+  just wrote. An `ivfflat`/`hnsw` index would cost build time and write
+  amplification for a query pattern that does not exist yet.
+- It becomes necessary the moment there is a "search all stored jobs" path
+  rather than "score the jobs this run fetched". That is the trigger to watch
+  for.
+
+---
+
+## 16. Scoring
+
+### 16.1 The scorer is pure; the pipeline is where I/O lives
+
+- `app/matching/scorer.py` imports no ORM, no HTTP client and no provider. It
+  takes frozen dataclasses and returns a `ScoreResult`.
+- **Why:** two payoffs. It can be tested exhaustively with no database (46 of
+  the 138 committed tests, running in 0.4s), and it is fast enough to run over
+  every job in a search. The moment an LLM call enters that file, a 200-job
+  search goes from seconds to roughly 25 minutes.
+
+### 16.2 Semantic score is the mean of the top 3 chunks — not the max, not all
+
+- **Against max:** every job description contains at least one paragraph of
+  generic engineering prose that any technical resume scores well against. Max
+  rewards a single lucky chunk, so the ranking ends up sorting on "which posting
+  happened to contain the most generic paragraph".
+- **Against mean-over-all:** it dilutes a genuinely strong requirements section
+  with the benefits boilerplate sitting next to it — precisely the problem
+  chunking was introduced to solve. A job with one perfect requirements chunk
+  and six paragraphs of legal text would score below a mediocre job with a short
+  description.
+- **Top-3 mean** requires three good passages, which means the *posting*
+  matches rather than one sentence of it. Three because the median chunked
+  description in testing produced 2-5 chunks; a larger k collapses into
+  mean-over-all for most jobs, and k=1 is max.
+- Fewer than three chunks uses all of them. Dividing by a fixed 3 would penalise
+  short postings for being short, which is not a property of the candidate.
+
+### 16.3 Cosine rescaling exists, and `COS_LO`/`COS_HI` are labelled as guesses
+
+- **Why rescale at all:** cosine similarity between related English text does
+  not use the [0, 1] range. Everything a resume is compared against is a job
+  description — same language, same register, same subject matter — so scores
+  cluster in a narrow band. Fed straight into the weighted sum, the semantic
+  term is nearly constant across the result set: it shifts the absolute score
+  but barely moves the *ranking*, so its nominal 40% weight buys 40% of nothing.
+  Rescaling the observed band onto [0, 1] is what restores the spread.
+- **Why p5/p95 and not min/max:** the extremes are one weird posting each.
+  Anchoring to them puts every real job back in a narrow middle, which is the
+  problem being solved. Clamping deliberately sacrifices the top and bottom 5% —
+  those jobs are already unambiguously good or bad, and their exact ordering
+  matters far less than resolution across the middle 90%.
+- `scripts/calibrate_similarity.py` prints the real distribution, and the
+  constants carry a comment saying they are placeholders. See section 19 for the
+  measured values and why they are not yet committed.
+
+### 16.4 Weighted recall, not Jaccard
+
+- `earned / possible` over the job's requirements, each weighted by
+  `SKILL_WEIGHTS`. A candidate is never penalised for knowing things the job did
+  not ask for.
+- **Why not Jaccard:** the denominator would include the resume's skills. A
+  senior engineer with forty skills would score *worse* against a five-skill
+  posting than a junior with exactly those five — same intersection, union eight
+  times larger. That is the opposite of useful, and it is the single most common
+  way this metric is got wrong. There is a test named for it
+  (`test_is_recall_not_jaccard`).
+- **Why not precision:** "what fraction of your skills does this job want" ranks
+  narrow jobs above broad ones for no reason a candidate cares about.
+- `required: 1.0` / `preferred: 0.4` — a preferred skill counts, but at well
+  under half the weight, so missing a "nice to have" barely moves the score.
+
+### 16.5 `None` for unparsed requirements; `1.0` for missing experience data
+
+Two applications of one principle: **absence of data is not evidence of a
+shortfall**, and the two cases must stay distinguishable in the output.
+
+- `skill_component` returns `None`, not `0.0`, when a job has no parsed
+  requirements. "We could not read this posting" and "this candidate matches
+  nothing in it" mean entirely different things, and collapsing them buries
+  every thin posting at the bottom of the results as though the candidate had
+  been rejected on merit. `ScoreResult.skills_unparsed` carries it to the UI,
+  which must say so — presenting a semantic-only score as a full match is a lie.
+- The fallback is `semantic * multiplier`, **not** `semantic * W_SEMANTIC`.
+  Multiplying by 0.4 would push every unparsed job below every scored one for a
+  reason unrelated to fit; dividing by 0.4 to "renormalise" would push them all
+  above. Letting semantic carry full weight is the least-wrong option, and it is
+  what the flag exists to disclose.
+- `experience_multiplier` returns 1.0 when *either* side is None. Most postings
+  state no parseable experience bar, and resumes frequently state no total.
+  Treating unknown as zero would penalise the majority of pairs for a gap in our
+  extraction rather than a gap in the candidate.
+- A multiplier rather than a subtracted term, floored at 0.70: being three years
+  short should discount an otherwise-excellent match, not flatten it.
+
+### 16.6 Explanations are capped at the top 20
+
+- **Why:** this is the pipeline's one genuinely expensive per-item operation — a
+  local 7b model producing prose, measured at 8-30 seconds per job on this
+  machine. Scoring 200 jobs takes seconds; explaining 200 would take the better
+  part of an hour, and 180 of those explanations would never be read.
+- 20 is one page of results. Everything below it is reachable by paginating,
+  which re-running a search would extend.
+- The cap is enforced in the pipeline rather than in `explain.py`, so the
+  explanation function stays a pure "explain this one match" and the policy
+  lives where the ranking is known.
+- **Consequence, stated plainly:** `GET /matches?offset=20` returns rows with
+  `explanation: null`. That is a visible gap in the API, not a bug, and the fix
+  when it matters is an on-demand explain endpoint rather than a larger cap.
+
+### 16.7 A weighted sum, not a learned model
+
+- 0.6/0.4 is a judgement, not a fitted parameter, and there is no labelled data
+  to fit against — nobody has told this system which matches were good.
+- Skills lead because that component is *actionable* ("you are missing
+  Kubernetes" is advice; "your cosine is 0.61" is not) and *checkable* — a skill
+  match is either there or it is not.
+- Semantic keeps a substantial 40% because skill extraction is lossy: it catches
+  named technologies and misses everything phrased as a sentence ("you have
+  operated something you built").
+- The weights sum to 1.0 and a test asserts it, because if they ever do not,
+  `overall_score` silently leaves [0, 1] and no longer fits
+  `matches.overall_score`'s `Numeric(5,4)`.
+
+---
+
+## 17. Pipeline and execution
+
+### 17.1 Stage ordering keeps model calls out of the wide part of the funnel
+
+The ordering *is* the design. Scoring (stage f) runs over every job and is pure
+arithmetic. The two stages that call a model are both bounded: skill extraction
+by the number of jobs not already extracted, explanation by a hard 20. A test
+(`test_scoring_makes_no_model_calls`) asserts the call counts rather than
+trusting the comment.
+
+### 17.2 Each stage commits on its own
+
+- **Why:** the entire point of the `stage` column is that a *different*
+  connection — the one serving `GET /runs/{id}` — can read progress while the
+  run is going. Buffered inside the pipeline's transaction it would become
+  visible exactly when it stops being useful.
+- Stages d and h also commit per item, because each item cost real model seconds
+  and a crash on job 90 of 100 must not discard the 89 already paid for.
+
+### 17.3 Work is skipped on "has no rows", not on "is new"
+
+Stage d skips jobs that already have `job_skills`; stage e skips jobs that
+already have `job_chunks`. Not `is_new`, because a job whose extraction failed or
+was interrupted last run would then never get another chance, while a job already
+processed would be re-read by the model on every subsequent search.
+
+### 17.4 The pipeline dedupes on `dedup_hash`; day 1's CLI does not
+
+- Day 1 deliberately stores one row per board (decision 3 — each copy has its own
+  apply URL). The search pipeline deliberately keeps one per `dedup_hash`.
+- Both are right for their context: showing a user the same job three times is
+  bad, and each extra copy costs a full local-model skill extraction. Row
+  identity in the table is still `(source, source_job_id)` — this only decides
+  what a single *run* bothers to write.
+
+### 17.5 `BackgroundTasks`, not Celery or RQ
+
+- **Why:** a search run is one long function, on one machine, with no fan-out, no
+  cross-process scheduling and no retry semantics worth speaking of. The state a
+  broker would manage is *already* in `ingestion_runs`, updated stage by stage,
+  and it survives a process restart in a way an in-memory Celery result does not.
+  Adding Redis plus a worker process would mean two more services, a
+  serialization boundary and a deployment story in exchange for nothing this
+  workload needs.
+- **What is genuinely given up, stated rather than hidden:** a task dies with the
+  process, and there is no retry and no concurrency limit. The failure is visible
+  rather than silent — the run row is left at `running` with a stale stage, which
+  is exactly the signal day 1 established for an abandoned run.
+- **The trigger to change:** more than one API process, or runs long enough that
+  deploys routinely kill one. At that point the pipeline itself needs no changes,
+  because `run_search` already takes every dependency by injection; only
+  `workers.py` is replaced.
+
+### 17.6 Providers are constructed in the worker, not the request handler
+
+So that a dead Ollama daemon fails the *run* — recorded, pollable, with a message
+naming the fix — rather than the POST that queued it.
+
+---
+
+## 18. Departures from the brief, and gaps it did not cover
+
+Each of these is a place where the day-3 specification was silent, or where
+following it literally would have caused a problem. Listed rather than absorbed.
+
+### 18.1 `queries.py` did not exist; it was written, and it is LLM-free
+
+The brief referenced it as an existing module. Query generation runs once per
+search, so a model call would have been affordable — but it would have meant a
+30-90 second wait before the first HTTP request went out, non-deterministic
+queries across runs of the same resume, and no benefit, because a job board's
+keyword search is a bag-of-words matcher that gains nothing from a fluent
+phrase. It builds from the candidate's job titles (seniority words stripped,
+since boards match them literally) and their most specific skills.
+
+### 18.2 `app/matching/skills.py` is a module the brief did not list
+
+Stage (d) — "extract + canonicalize skills into job_skills" — is two concerns: a
+model call, and a database identity mapping. Neither belongs inline in the
+orchestration. Canonicalisation is not optional detail: two jobs that both want
+"React" must resolve to the same `skills.id`, or the skill component becomes set
+intersection over strings differing by case or alias, silently returns nothing,
+and makes every candidate look unqualified.
+
+### 18.3 Job skill extraction has no retry loop, unlike resume extraction
+
+An empty result is a *legitimate* answer here — plenty of postings list no
+concrete requirements — and `skill_component` already handles that case
+explicitly. Retrying would spend another local-model minute per job arguing with
+a model that was right the first time. Resume extraction retries because an empty
+parse there is unambiguously a failure.
+
+### 18.4 `queued`/`succeeded` versus day 1's `success`
+
+The brief specified `queued -> running -> succeeded`; day 1 verified
+`running -> success`. Renaming either would break verified behaviour or diverge
+from the specification, so **both vocabularies now share the column** and
+`app/runs.py` owns them, with `is_terminal()` / `is_success()` predicates that
+every reader goes through instead of comparing to a literal. `GET /runs/{id}`
+exposes `is_terminal` for exactly this reason.
+
+**This is a wart and it is worth removing.** The clean fix is a migration that
+rewrites `success` to `succeeded` and deletes the day-1 constant. It was not done
+today because it touches day 1's verified paths and belongs in its own change.
+
+### 18.5 `POST /resumes` and `PATCH /resumes/{id}/skills` had to be written
+
+The brief required `build_resume_embedding_text` to be used "on both", but day 2
+stopped short of persisting a parsed resume at all, so neither endpoint existed.
+They live in `app/api/resumes.py`, sharing one invariant: **whenever a resume's
+skills or parse change, its embedding is rebuilt and its matches are dropped.** A
+match scored against the old skill set is not stale, it is wrong, and nothing in
+the `matches` table records which skill set produced it.
+
+### 18.6 The resume embedding excludes education, not just its boilerplate
+
+The brief named "address, hobbies and education boilerplate". Education is
+excluded entirely: a degree title matches every posting's degree requirement
+about equally, so it adds distance to no one while consuming a large share of the
+embedded tokens. Dates are dropped for the same reason — "Jan 2020 - Present" is
+noise under cosine.
+
+### 18.7 `POST /resumes` is synchronous and slow (60-120s)
+
+Unlike a search, there is nothing useful to return early: the resume's id is
+worthless to a caller who cannot search on it yet, and `POST /searches` rejects
+an unparsed resume with a 409. Uploading is also once-per-resume, where searching
+is the repeated action. **This is the weakest endpoint in the surface**, and the
+fix is the pattern already built next door — a run row plus `BackgroundTasks`.
+
+### 18.8 No auth, no rate limiting, no CORS
+
+Not in scope and not built. Stated because the surface is now large enough that
+its absence matters: `GET /matches?resume_id=` returns anyone's matches to anyone
+holding the UUID, and `POST /searches` queues unbounded background work for an
+unauthenticated caller. This is a localhost-only service until that changes.
+
+### 18.9 `LLMProvider` gained an abstract `complete_text`
+
+Explanations are prose. Forcing them through `complete()` with a one-field
+wrapper schema would constrain the decoder for no benefit and spend tokens on
+JSON punctuation. Abstract rather than defaulted in terms of `complete()`, since
+every real backend has a plain completion call and a default would let a future
+provider silently inherit a worse one.
+
+---
+
+## 19. Verification performed (day 3)
+
+**The suite is finally in the repo.** Two days of decisions recommended it; day 3
+committed it. 193 tests, `pytest` added to `requirements.txt`.
+
+| Check | Result |
+|---|---|
+| Migration `0003` up: `job_chunks` created, `jobs.embedding` dropped | pass |
+| `0003` downgrade -> re-upgrade | pass |
+| `alembic check` (no model/migration drift) | pass |
+| `tests/test_scorer.py` — 46 tests, no I/O | pass |
+| `tests/test_chunking.py` — 25 tests, no I/O | pass |
+| `tests/test_matching_units.py` — 30 tests (queries, explain, embedding text) | pass |
+| `tests/test_pipeline.py` — 14 tests, real Postgres, faked models | pass |
+| `tests/test_api.py` — 23 tests, real Postgres, TestClient | pass |
+| `cosine_similarity` vs identical / orthogonal / opposite / zero vectors | pass |
+| `skill_component` returns `None` (not `0.0`) for empty `job_skills` | pass |
+| `experience_multiplier` returns 1.0 for a `None` requirement | pass |
+| `semantic_component` with 1 and 2 chunks (fewer than top-k) | pass |
+| Run transitions `queued -> running -> succeeded`, observed mid-run | pass |
+| Scoring makes zero model calls (asserted on call counters) | pass |
+| Explanations capped at 20 over a 25-job run, highest-scoring first | pass |
+| Re-running: no re-extraction, no re-chunking, no duplicate rows | pass |
+| Failure paths: partial, failed, exception recorded *and* re-raised | pass |
+| No run left in a non-terminal state on any path | pass |
+| `POST /searches` returns 202 in single-digit ms | pass |
+| `PATCH .../skills` re-embeds and clears matches | pass |
+| End-to-end with the **real** Ollama daemon (see below) | pass |
+
+### 19.1 The end-to-end run against real models, and the defect it found
+
+Because Adzuna credentials are still placeholders, the source was local, but
+every model call was real: `qwen2.5:7b` for resume extraction, skill
+classification and explanations, `nomic-embed-text` for all embeddings. Twelve
+job descriptions spanning a deliberate relevance gradient (senior backend
+payments through to enterprise SaaS sales) against one synthetic backend resume.
+
+**The first run's ranking was wrong, and the reason is worth recording.**
+
+Asked for a posting's skills, `qwen2.5` answers in the posting's own words,
+because that is what the document says. It returned entries like:
+
+    "Strong Python"
+    "Comfortable with Docker"
+    "FastAPI or Django in production"
+    "5+ years of professional backend development"
+    "Experience running services in production, including on-call"
+
+Stored verbatim, none of those canonicalise onto the resume's `Python`,
+`Docker`, `FastAPI`. So a candidate holding Python, FastAPI, Docker, Kubernetes
+and Kafka scored **`skill = 0.065`, one requirement matched out of eight**,
+against the senior backend posting she was an obvious fit for. And because a few
+postings happened to yield short names ("Python", "SQL", "PyTorch"), the ranking
+*inverted*: Machine Learning Engineer came first, Senior Backend Engineer third,
+Backend Engineer fourth at `skill = 0.000`.
+
+This is the failure mode that makes canonicalisation load-bearing rather than
+tidy-up, and it is invisible without an end-to-end run: every unit test passed,
+because the scorer was doing exactly what it was told with the ids it was given.
+The `skills` table had filled up with 94 rows of requirement prose.
+
+**The fix has two halves,** because either alone is unreliable:
+
+1. The prompt and the field description now demand bare canonical names, with
+   explicit rewrites ("Write 'Python', not 'Strong Python'").
+2. `clean_skill_name()` enforces it regardless of what the model returns —
+   stripping stacked qualifiers, dropping durations and prose, splitting lists
+   ("FastAPI or Django" is two skills), and rejecting phrases that name a
+   discipline rather than a skill. It is applied to resume skills too: both
+   sides of the intersection have to be cleaned the same way, or a resume saying
+   "Strong Python" still misses a job saying "Python".
+
+`tests/test_skill_names.py` pins all of it, using the model's real output as the
+test cases.
+
+**After the fix, the same twelve jobs against the same resume:**
+
+| Job | skill before | skill after | rank before | rank after |
+|---|---|---|---|---|
+| Senior Backend Engineer | 0.065 (1/8) | **1.000 (7/7)** | 3 | **1** |
+| Python Developer | 0.077 (1/7) | **0.871 (6/8)** | 2 | 2 |
+| Backend Engineer, Platform | 0.000 (0/6) | **0.783 (6/7)** | 4 | 3 |
+| DevOps Engineer | 0.000 (0/6) | 0.515 (4/9) | 7 | 4 |
+| Machine Learning Engineer | 0.333 (3/9) | 0.333 (3/9) | **1** | **7** |
+| Senior Frontend Engineer | 0.000 (0/10) | 0.000 (0/10) | 9 | 11 |
+| Enterprise Sales Executive | 0.000 (0/6) | 0.000 (0/4) | 12 | 12 |
+
+The extractor now returns `Python, PostgreSQL, Docker` as required and
+`FastAPI, Django, Kafka, Kubernetes` as preferred for the senior backend
+posting — the same requirements it read before, named canonically. Note that
+Machine Learning Engineer's skill score did not change at all: it was never
+wrong, it was simply the only job whose extraction happened to produce matchable
+names, which is precisely what put it top of a broken ranking.
+
+Also confirmed by the run:
+
+- `build_resume_embedding_text` excluded phone, email, university and hobbies.
+- Skill classification distinguished required from preferred using the posting's
+  own "nice to have" / "bonus" language, and got it right on every sample.
+- Explanations named specific held and missing skills without inventing any,
+  and correctly said "you have a strong background in sales but lack..." for the
+  sales role rather than inventing an overlap.
+- No run was left in a non-terminal state; stage advanced through the declared
+  order and finished at `done`. `ingestion_runs.stage` was readable from a
+  second connection while the run was in progress, which is the whole point of
+  17.2.
+- Timings on this machine: resume extraction 121s; the full 12-job pipeline
+  672s, essentially all of it in stages d and h (one skill extraction and one
+  explanation per job). Scoring and match-writing were not measurable against
+  that.
+
+**Not exercised by this corpus:** multi-chunk descriptions. All twelve postings
+chunked to exactly one chunk, because they are 150-250 words and the target
+chunk size is 200-400 tokens. Real postings are longer, and the multi-chunk path
+is covered only by `tests/test_chunking.py`, not by a live run.
+
+### 19.2 A second defect: a timeout reported as an unreachable daemon
+
+The re-run after the skill-name fix failed with:
+
+    LLMUnavailableError: Cannot reach the Ollama daemon at
+    http://localhost:11434. Is it running? Try: ollama serve
+
+The daemon was running and answering. The real cause was a **read timeout**:
+resume extraction had measured 170.6s against `ollama_timeout_seconds = 180`, and
+the second run landed on the wrong side of that margin.
+
+The bug is in the day-2 error mapping, which this day's refactor moved but did
+not re-examine: `httpx.TimeoutException` **subclasses** `httpx.TransportError`,
+so the connection-failure branch swallowed every timeout and gave advice that
+would waste an operator's time on a daemon that is already up.
+
+Fixed in both providers by catching `httpx.TimeoutException` *before*
+`TransportError` — clause ordering is the whole fix — with a message that names
+the elapsed limit and the setting to change. `ollama_timeout_seconds` was also
+raised from 180 to 300, since a 180s budget for a task that measures 170s is a
+coin flip rather than a limit. `tests/test_providers.py` pins the ordering,
+including an explicit assertion that `ReadTimeout` really is a `TransportError`
+subclass, so the two clauses cannot be reordered back.
+
+Worth stating plainly: this was only ever going to be found by running the thing
+end to end on a slow machine. Nine of the tests now covering it were written
+after the failure, not before it.
+
+**Note for `.env.example`:** it should gain an `OLLAMA_TIMEOUT_SECONDS=300` line
+to match. That edit was not made — the file was not writable in this
+environment — so the setting is currently documented only in `app/config.py` and
+in the timeout error message itself.
+
+### 19.3 Calibration was measured but is NOT committed
+
+`scripts/calibrate_similarity.py` was run against the corpus above, and the
+placeholder `COS_LO, COS_HI = 0.45, 0.85` remains in the code deliberately.
+
+The measurement, over 12 jobs:
+
+```
+Per-job top-3 mean
+  n=12  min=0.5017  mean=0.6765  max=0.7982
+  p5=0.5645  p25=0.6321  p50=0.6630  p75=0.7224  p95=0.7942
+```
+
+**This is the narrow-band problem, measured.** The single worst match in the
+set — a backend engineer's resume against an enterprise SaaS sales role, which
+share essentially nothing — still scores **0.50**. The best scores 0.80. Nothing
+is near 0, nothing is near 1, and 90% of the mass sits inside a 0.23-wide band.
+Fed unrescaled into the weighted sum, the semantic term would vary by about
+0.09 across the entire result set while nominally carrying 40% of the score.
+That is the failure 16.3 describes, and it is not hypothetical.
+
+The placeholder `[0.45, 0.85]` turns out to be a reasonable guess but slightly
+too wide on both ends, which compresses the rescaled range. The measured p5/p95
+would suggest roughly `[0.56, 0.79]`.
+
+**It is still not committed**, and the script itself declined to recommend it:
+
+```
+Not enough data to calibrate confidently (fewer than 20 samples).
+Ingest more jobs and re-run.
+```
+
+That guard firing is the right outcome. The band is real but the *corpus* is
+not — twelve hand-written descriptions do not have the distribution of a few
+hundred real Adzuna postings, and every one of them is a software role, which
+narrows the band further than a real result set would. Committing a
+fitted-looking constant derived from synthetic data is worse than leaving a
+labelled guess, because the next person to read it cannot tell the difference.
+
+**This is the first thing to do once Adzuna credentials are real:** ingest a few
+hundred postings, re-run the script, and set the two constants from p5/p95.
+
+### 19.4 Still not verified
+
+- **A live Adzuna API call.** Unchanged since day 1: `.env` holds `test_id` /
+  `test_key`, and a real fetch returns 401. Every Adzuna response-shape
+  assumption remains unconfirmed.
+- **Real resumes.** Extraction has now been exercised against two synthetic
+  resumes. Real ones are messier — multi-column PDFs, tables, headers — and the
+  24k truncation has still never fired against one.
+- **Concurrency.** Two searches for the same resume running at once is handled in
+  principle (every write is an upsert, `SkillCanonicalizer` loses races safely)
+  but has not been run.
+- **Scale.** The largest run tested is 25 jobs. The N+1-avoiding bulk loads in
+  `_load_postings` were written for 200+ but have not been measured there.

@@ -199,8 +199,13 @@ class Job(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(EMBEDDING_DIM), nullable=True
+    # NOTE: there is deliberately no jobs.embedding column. Day 3 replaced the
+    # single whole-description vector with per-chunk vectors in job_chunks —
+    # see JobChunk below and DECISIONS 15.1.
+    chunks: Mapped[list["JobChunk"]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="JobChunk.chunk_index",
     )
 
     __table_args__ = (
@@ -208,6 +213,47 @@ class Job(Base):
         # provider guarantees stable, so it — not dedup_hash — defines identity.
         UniqueConstraint("source", "source_job_id", name="uq_jobs_source_source_job_id"),
         Index("ix_jobs_dedup_hash", "dedup_hash"),
+    )
+
+
+class JobChunk(Base):
+    """One passage of a job description, with its own embedding.
+
+    Replaces the day-1 ``jobs.embedding`` column. A job description is a
+    composite document — responsibilities, requirements, benefits, an equal-
+    opportunity boilerplate paragraph — and averaging all of it into one vector
+    pulls every posting towards the same bland centroid. Chunking lets the
+    strongest *passage* speak for the job (see scorer.semantic_component).
+    """
+
+    __tablename__ = "job_chunks"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    # 0-based position in the description. Ordering matters for display: a chunk
+    # shown out of sequence reads as a different job.
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Non-null: a chunk row exists only because it was embedded. Unlike
+    # resumes.embedding there is no "created but not yet embedded" state —
+    # chunking and embedding happen in the same pipeline stage.
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(EMBEDDING_DIM), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    job: Mapped[Job] = relationship(back_populates="chunks")
+
+    __table_args__ = (
+        # Makes re-chunking idempotent: the pipeline can upsert chunk N without
+        # first deleting, and a retry cannot double-insert.
+        UniqueConstraint("job_id", "chunk_index", name="uq_job_chunks_job_id_index"),
+        # "all chunks for this job" is the only access path scoring ever uses.
+        Index("ix_job_chunks_job_id", "job_id"),
     )
 
 
@@ -263,8 +309,15 @@ class IngestionRun(Base):
         ForeignKey("resumes.id", ondelete="SET NULL"),
         nullable=True,
     )
-    # "running" | "success" | "partial" | "failed".
+    # Day 1 (CLI ingestion): "running" | "success" | "partial" | "failed".
+    # Day 3 (search pipeline): "queued" | "running" | "succeeded" | "partial" |
+    # "failed". See app/runs.py, which owns both vocabularies and the
+    # is_terminal / is_success predicates every reader should use.
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Which step of the pipeline is executing right now. Purely for progress
+    # display while status == "running": GET /runs/{id} is polled and "running"
+    # on its own tells a user nothing about whether to keep waiting.
+    stage: Mapped[str | None] = mapped_column(Text, nullable=True)
     sources: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )

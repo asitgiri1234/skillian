@@ -389,7 +389,9 @@ def _load_postings(session: Session, job_ids: Sequence[UUID]) -> list[JobPosting
     for job_id, skill_id, name, requirement in session.execute(
         select(JobSkill.job_id, JobSkill.skill_id, Skill.name, JobSkill.requirement)
         .join(Skill, Skill.id == JobSkill.skill_id)
-        .where(JobSkill.job_id.in_(job_ids))
+        # active only: a blocklisted skill still has job_skills rows from
+        # before it was pruned, and scoring must not count them.
+        .where(JobSkill.job_id.in_(job_ids), Skill.active.is_(True))
     ):
         skills_by_job.setdefault(job_id, []).append(
             JobSkillRef(skill_id=skill_id, name=name, requirement=requirement)

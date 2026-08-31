@@ -229,8 +229,10 @@ def build_index(session: Session) -> SkillIndex:
     lookup: dict[str, tuple[UUID, str]] = {}
     skipped = 0
 
+    # active only: blocklisted rows stay in the table (job_skills still
+    # references them) but must never match again. See DECISIONS 25.
     for skill_id, name, aliases in session.execute(
-        select(Skill.id, Skill.name, Skill.aliases)
+        select(Skill.id, Skill.name, Skill.aliases).where(Skill.active.is_(True))
     ):
         if clean_skill_name(name) != [name]:
             skipped += 1

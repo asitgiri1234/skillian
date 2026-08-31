@@ -17,13 +17,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import get_settings  # noqa: E402
 from app.ingest import IngestionResult, run_ingestion  # noqa: E402
-from app.sources.adzuna import AdzunaSource  # noqa: E402
+from app.sources.adzuna import AdzunaSource
+from app.sources.greenhouse import GreenhouseSource
+from app.sources.lever import LeverSource  # noqa: E402
 from app.sources.base import JobSource, SearchQuery  # noqa: E402
 
 # The only place source classes are named. A new source is added here and in its
 # own file — nothing else changes.
 SOURCE_REGISTRY: dict[str, type[JobSource]] = {
     AdzunaSource.name: AdzunaSource,
+    GreenhouseSource.name: GreenhouseSource,
+    LeverSource.name: LeverSource,
 }
 
 _COLUMNS: tuple[tuple[str, str, int], ...] = (

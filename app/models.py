@@ -103,6 +103,21 @@ class Skill(Base):
     aliases: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )
+    # False for terms that are not skills — job titles ("Backend Engineer"),
+    # abstract qualities ("Scalability"), and sentence fragments the early LLM
+    # extractor wrote in ("exp", "Passion for quality"). Flagged rather than
+    # deleted: job_skills and resume_skills still reference these rows, and the
+    # flag keeps a record of what was pruned and is reversible.
+    # Extraction and scoring both filter on active. See DECISIONS 25.
+    active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+
+    __table_args__ = (
+        # Partial: every read filters `active = true`, and the inactive rows are
+        # a small minority no query scans.
+        Index("ix_skills_active", "active", postgresql_where=text("active")),
+    )
 
 
 class ResumeSkill(Base):

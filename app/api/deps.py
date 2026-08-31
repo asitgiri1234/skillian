@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.sources.adzuna import AdzunaSource
+from app.sources.greenhouse import GreenhouseSource
+from app.sources.lever import LeverSource
 from app.sources.base import JobSource
 
 #: The sources a search may fetch from. Mirrors SOURCE_REGISTRY in
@@ -16,6 +18,8 @@ from app.sources.base import JobSource
 #: decision as exposing it to an HTTP caller.
 SOURCE_REGISTRY: dict[str, type[JobSource]] = {
     AdzunaSource.name: AdzunaSource,
+    GreenhouseSource.name: GreenhouseSource,
+    LeverSource.name: LeverSource,
 }
 
 

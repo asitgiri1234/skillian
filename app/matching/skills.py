@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.matching.blocklist import is_disallowed
 from app.models import Skill
 from app.normalize import normalize_text
 from app.providers import LLMProvider
@@ -392,7 +393,9 @@ class SkillCanonicalizer:
         self._load()
 
     def _load(self) -> None:
-        for skill in self._session.execute(select(Skill)).scalars():
+        for skill in self._session.execute(
+            select(Skill).where(Skill.active.is_(True))
+        ).scalars():
             self._index.setdefault(normalize_text(skill.name), skill.id)
             for alias in skill.aliases or []:
                 # setdefault, not assignment: a canonical name always outranks
@@ -412,6 +415,15 @@ class SkillCanonicalizer:
         existing = self._index.get(key)
         if existing is not None:
             return existing
+
+        # Refuse to create a row the blocklist already rejected, or one shaped
+        # like a job title. Checked at creation because `active` lives on the
+        # row: without this a blocklisted term reappears under a fresh id on the
+        # next run and the pruning is undone silently. See DECISIONS 25.3.
+        reason = is_disallowed(name)
+        if reason is not None:
+            logger.debug("Refusing to create skill %r: %s", name, reason)
+            return None
 
         # ON CONFLICT DO NOTHING + a follow-up SELECT rather than a plain INSERT:
         # two search runs can extract the same new skill concurrently, and losing

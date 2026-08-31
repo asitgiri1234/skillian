@@ -1865,3 +1865,216 @@ postings whose entire 500-character description is an equal-opportunity notice
 with no technology named anywhere — "This job is with X, an inclusive employer
 and a member of myGwork...". The marker phrases did not miss; there was nothing
 to find. That is a source-truncation problem (23.1), not an extraction problem.
+
+---
+
+# Decisions — Day 3e (vocabulary pruning, Greenhouse and Lever)
+
+---
+
+## 25. Pruning the skill vocabulary
+
+### 25.1 A flag, not a delete
+
+`skills.active` (migration 0004), default true, false on 38 blocklisted rows.
+
+Deleting was rejected: `job_skills` and `resume_skills` reference these rows, a
+delete destroys the record of what was pruned, and it is irreversible. The flag
+keeps every foreign key valid and the decision auditable. Extraction
+(`jd_skills.build_index`), canonicalisation (`SkillCanonicalizer`), scoring
+(`pipeline._load_postings`) and the API (`GET /jobs/{id}`) all filter
+`active = true` — the last two matter because a pruned skill still has
+`job_skills` rows written before it was pruned.
+
+The 210 rows matching nothing were left alone, as instructed: inert, and
+deleting them is unnecessary risk.
+
+### 25.2 The blocklist is data, with a reason per term
+
+`app/data/skill_blocklist.csv` — 38 rows of `term,category,reason`. Not a
+Python list: it is a set of *judgements about data*, each needing a stated
+reason, and it should be reviewable in a diff by someone who does not read
+Python. Adding a term is a one-line data change.
+
+Categories used: `job_title`, `job_function`, `abstract_noun`, `category`,
+`buzzword`, `industry`, `domain`, `soft_skill`, `quality_attribute`,
+`fragment`, `ambiguous_word`.
+
+**My judgement on the 9 terms not covered by explicit instruction**, applying
+the stated test — named technology or checkable competency, versus fragment,
+job function or abstract quality:
+
+| Term | Decision | Reason |
+|---|---|---|
+| API development | blocked | Job function; "REST APIs" is the skill |
+| Cloud-based applications | blocked | Abstract noun phrase; AWS/Azure/GCP are the skills |
+| ML solutions | blocked | "solutions" fragment; Machine Learning already exists |
+| Python frameworks | blocked | Category; Django/Flask/FastAPI are the skills |
+| NoSQL databases | blocked | Category suffix duplicating the kept `NoSQL` |
+| Software Architecture | blocked | Same class as the blocked `architecture` |
+| Technical Architecture | blocked | Same class as the blocked `architecture` |
+| Agentic | blocked | Adjective buzzword |
+| Promises | blocked | Ordinary English word; matches "promises to deliver" far more often than the JS concept |
+| asynchronous programming | **kept** | Genuine competency, comparable to the kept `Data Structures` |
+| Data Modelling, Golang, Nodejs, React.js, Mysql, RabbitMq, Agile Scrum | **kept** | Real technologies; some are unnormalised spellings, which is a separate merge task |
+| Sales | **kept** | A real skill for sales roles — see 25.5, where this turned out to matter |
+
+### 25.3 The recurrence guard
+
+`blocklist.is_disallowed()` runs at skill *creation*, refusing:
+
+* anything on the checked-in blocklist;
+* anything whose **final** word is Engineer, Developer, Architect, Manager,
+  Analyst, Specialist, Consultant, Lead or Intern.
+
+Checked at creation because `active` lives on the *row*: without this, a
+blocklisted term reappearing in a future posting is inserted under a fresh id
+and the pruning is silently undone. Only a trailing title word counts, so
+"Engineering Productivity Tooling" survives.
+
+---
+
+## 26. Greenhouse and Lever
+
+### 26.1 Why: Adzuna's 500-character cap was breaking matching
+
+Measured, not assumed. Median description length:
+
+| Source | n | median | min | max |
+|---|---|---|---|---|
+| adzuna | 90 | **500** | 283 | 500 |
+| greenhouse | 118 | **5543** | 1130 | 12072 |
+| lever | 118 | **5047** | 1239 | 13642 |
+
+Adzuna's median is exactly the cap — every posting of substance is truncated.
+Eleven times more text from the board APIs.
+
+### 26.2 Per company, not per query
+
+Neither API has a search endpoint; both take a company slug. So `fetch` ignores
+`query.keywords` and returns the whole board, letting dedup and scoring filter —
+the scorer already ranks, and a keyword pre-filter here would discard postings
+before they could be scored. `remote_only` and `max_results` *are* honoured,
+because both are caps rather than search terms.
+
+`base.py` and `adzuna.py` are untouched.
+
+### 26.3 The slug list is checked-in data, and verified
+
+`app/sources/company_boards.py`: 34 Greenhouse + 6 Lever slugs, **every one
+verified to return at least one posting on 2026-08-31**.
+
+**Indian coverage is thinner than intended and the reason is worth recording:**
+most large Indian tech employers do *not* expose a public Greenhouse or Lever
+board. Razorpay, Swiggy, Zomato, Flipkart, PhonePe, Meesho, Zerodha, Freshworks,
+Zoho, Byju's, Unacademy, Lenskart, Nykaa, Delhivery, Udaan, BrowserStack,
+Hasura, Chargebee and ~30 others were probed and all 404'd; they run their own
+careers sites or a private ATS. The `NOT_FOUND` dict records every failure so
+nobody rediscovers this. What survives is India-headquartered companies that do
+use these boards (Groww, Postman, Druva, Netradyne, HighRadius, Glance, Zenoti,
+HackerRank, Rubrik, Zeta, FamPay, CRED, Fi) plus remote-friendly global
+companies hiring into India.
+
+### 26.4 Round-robin interleaving, because the boards are wildly unequal
+
+The 40 boards hold ~6,500 postings, and Databricks alone has 855. Concatenating
+and truncating to a cap would fill it entirely from the first two boards.
+`interleave()` takes one posting from each board in turn, so a 120-job cap is
+spread across all 40 employers.
+
+### 26.5 `asyncio.gather` over `asyncio.to_thread`
+
+Forty sequential HTTPS round trips is ~40s of pure waiting. `JobSource.fetch` is
+a synchronous interface that must not change, so the blocking per-board call is
+pushed to a worker thread and gathered, with a semaphore capping in-flight
+requests at 8 so a 40-board list does not open 40 sockets against two hosts.
+`return_exceptions=True`: one dead board must not lose the other 39.
+
+### 26.6 HTML handling
+
+Greenhouse `content` is entity-encoded markup. Block-level tags are converted to
+newlines *before* tags are stripped — without that the posting collapses to one
+paragraph and `jd_skills.split_sections`, which anchors its markers to line
+starts, never fires. Lever additionally returns `lists`, an already-structured
+array of `{heading, content}` blocks; those headings are re-emitted on their own
+lines rather than flattened, which is why Lever produces the most `preferred`
+skills of any source.
+
+---
+
+## 27. Measured after both changes
+
+326 jobs (90 Adzuna, 118 Greenhouse, 118 Lever) from 342 fetched, 16 dropped as
+cross-source duplicates.
+
+### 27.1 The preferred branch finally fires
+
+**This was the key number, and it moved.**
+
+| Source | required | preferred |
+|---|---|---|
+| adzuna | 150 | **0** |
+| greenhouse | 451 | **42** |
+| lever | 601 | **50** |
+| **total** | 1202 | **92** |
+
+Adzuna still returns exactly zero preferred, on 90 postings. That is now
+positively diagnostic rather than a mystery: the section markers are fine, the
+descriptions are simply cut off before a "nice to have" section appears.
+`SKILL_WEIGHTS["preferred"] = 0.4` is live code again.
+
+### 27.2 Skills per job, by source
+
+| Source | jobs | mean | median | zero |
+|---|---|---|---|---|
+| adzuna | 90 | 1.7 | **0** | **45 (50%)** |
+| greenhouse | 118 | 4.2 | 3 | 8 (7%) |
+| lever | 118 | 5.5 | 4 | 5 (4%) |
+
+Half of all Adzuna postings still yield nothing. The board sources are an order
+of magnitude better on the same extractor and the same vocabulary — the
+difference is entirely the source text.
+
+### 27.3 Four of the six missing resume skills now match
+
+| | before | after |
+|---|---|---|
+| Kubernetes | 0 | **14** |
+| Linux | 0 | **9** |
+| Kafka | 0 | **5** |
+| Terraform | 0 | **5** |
+| Celery | 0 | 0 |
+| pytest | 0 | 0 |
+
+Celery and pytest remain at zero. Both are real and both are in the vocabulary;
+they are simply niche enough not to appear in a 326-job sample dominated by
+large-company postings.
+
+### 27.4 OPEN: pruning worked, and surfaced the next layer
+
+The 38 blocked terms are gone from the results. But the new most-matched head
+contains a *different* class of false positive, which the short Adzuna teasers
+had been masking:
+
+| Matches | Skill | Assessment |
+|---|---|---|
+| 95 | Sales | Mostly legitimate — the Binance and GoHighLevel boards post many Account Executive roles — but "Full Stack Developer Intern" also matched, from prose |
+| 75 | Security | **False positives.** Matched "Account Executive", "ABM Manager", "Accountant II" — the word appears in ordinary prose |
+| 54 | Observability | **False positives.** Matched "Accountant II", "AI Advisory Consultant". My seed gave it the alias `monitoring`, which is far too broad |
+| 35 | UPI | Plausible on fintech-heavy boards, unverified |
+
+The mechanism is new: generic single-word skills matching *prose* in a
+5,000-character document. A 500-character teaser rarely contained enough prose
+to trigger it. Two fixes suggest themselves — tightening over-broad aliases
+(`monitoring` → Observability is the clearest offender), and requiring
+list-context for generic single-word terms, much as `_short_name_ok` already
+does for `R` and `Go`.
+
+**Not fixed in this pass.** It is a new finding from new data, and folding it in
+silently would hide that the previous prune both worked and was incomplete.
+
+### 27.5 Cost
+
+Extraction 25.1s for 326 jobs (77ms/job — up from 16ms because the documents are
+11x longer). Embedding 953 chunks in 474.6s, which is now the slowest stage by a
+wide margin at ~0.5s/chunk, exactly as measured on day 3b.

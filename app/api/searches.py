@@ -257,7 +257,7 @@ def get_job(job_id: UUID, session: Session = Depends(get_session)) -> JobDetail:
         for skill_id, name, requirement in session.execute(
             select(JobSkill.skill_id, Skill.name, JobSkill.requirement)
             .join(Skill, Skill.id == JobSkill.skill_id)
-            .where(JobSkill.job_id == job_id)
+            .where(JobSkill.job_id == job_id, Skill.active.is_(True))
             .order_by(Skill.name)
         )
     ]

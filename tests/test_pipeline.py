@@ -308,15 +308,17 @@ class TestPipelineWork:
         )
         assert indexes == list(range(len(indexes)))
 
-    def test_only_explanations_call_a_model(
+    def test_the_pipeline_makes_no_model_calls_at_all(
         self, db_session, session_factory, resume_row, fake_llm, fake_embedder
     ):
         """The pipeline's central performance claim, asserted rather than
         commented.
 
-        Stage (d) used to make one generative call per job. It is now a
-        dictionary lookup, so the *only* per-item model call left is the
-        explanation in stage (h), and `complete` is never called at all.
+        Stage (d) was a generative call per job and is now a dictionary lookup;
+        stage (h) was a capped LLM call and is now a template. With
+        EXPLANATION_MODE=template — the default — a whole search touches the
+        language model **zero** times. Only resume parsing does, once per
+        upload. See DECISIONS 32.1.
         """
         jobs = [_job(i) for i in range(5)]
         run = create_search_run(db_session, resume_row.id, ["fake"])
@@ -329,16 +331,18 @@ class TestPipelineWork:
             embedder=fake_embedder,
             session_factory=session_factory,
         )
-        # Zero structured calls: skill extraction no longer uses a model.
         assert fake_llm.complete_calls == []
-        # One explanation per job, since 5 is under the cap of 20.
-        assert len(fake_llm.complete_text_calls) == 5
+        assert fake_llm.complete_text_calls == []
 
-    def test_explanations_are_capped_at_twenty(
+    def test_every_match_gets_a_templated_explanation(
         self, db_session, session_factory, resume_row, fake_llm, fake_embedder
     ):
-        """25 jobs in, 25 scored, 20 explained. The cap is what keeps a large
-        search from spending half an hour in the local model."""
+        """25 jobs in, 25 scored, **25 explained**.
+
+        The LLM path capped explanations at 20, which left 306 of 326 cards
+        blank on the real corpus. A card with a score and no reason is not a
+        match explanation.
+        """
         jobs = [_job(i, company=f"Company {i}") for i in range(25)]
         run = create_search_run(db_session, resume_row.id, ["fake"])
         outcome = run_search(
@@ -351,14 +355,15 @@ class TestPipelineWork:
             session_factory=session_factory,
         )
         assert outcome.matches_written == 25
-        assert outcome.explanations_written == 20
-        assert len(fake_llm.complete_text_calls) == 20
+        assert outcome.explanations_written == 25
+        assert fake_llm.complete_text_calls == []
 
         explained = db_session.execute(
             select(Match)
             .where(Match.resume_id == resume_row.id, Match.explanation.isnot(None))
         ).scalars().all()
-        assert len(explained) == 20
+        assert len(explained) == 25
+        assert all(m.explanation.strip() for m in explained)
 
     def test_explanations_go_to_the_highest_scoring_matches(
         self, db_session, session_factory, resume_row, fake_llm, fake_embedder

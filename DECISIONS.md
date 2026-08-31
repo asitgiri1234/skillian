@@ -2540,3 +2540,122 @@ into the frontend contract.
 
 `SCORER_VERSION` bumped to `skillian-scorer-2`, so matches scored under the old
 weights and bounds are distinguishable in the table rather than silently mixed.
+
+---
+
+# Decisions — Day 3i (explanations, CORS; backend closed)
+
+## 32. Templated explanations
+
+### 32.1 Templates for every match, replacing a capped LLM call
+
+`explanation` was NULL across all 326 matches: stage h ran the LLM explainer,
+which costs 8-30s per job and is therefore capped at 20. On the real corpus that
+leaves **306 of 326 cards with a score and no reason**, which is not a match
+explanation.
+
+`render_explanation()` builds the text from fields already stored on the match —
+`tier`, `matching_skills`, `missing_skills`, `parsed_count`, `skills_unparsed`.
+No model call. **326 explanations backfilled in 0.140s.**
+
+`EXPLANATION_MODE` (`template` | `llm`, default `template`) selects between them
+rather than deleting the LLM path, which still renders better prose when someone
+is willing to pay for it and remains tested.
+
+**Consequence worth stating: a search now makes zero language-model calls.**
+Stage d became a dictionary lookup (24), stage h became a template. Only resume
+parsing still uses a model, once per upload. There is a test asserting the call
+counters are empty rather than a comment claiming it.
+
+Deterministic by construction, for the same reason the LLM path used
+`temperature=0`: a re-run must not silently reword every card and make two
+identical runs look different.
+
+### 32.2 Two things the templates say that the model could not
+
+Both come from numbers the model never sees, which is why they were impossible
+before calibration produced them.
+
+**Thin evidence.** When `parsed_count` is 1 or 2, the text appends "Based on
+only N stated requirement(s), so treat it as a rough signal." This is the honest
+surfacing of the asymmetry in 30.1 — recall saturates on thin extraction, and
+`skill_confidence` discounts the score but cannot make a one-line job ad into
+evidence. Storing the confidence value was justified on the grounds that a UI
+could disclose it; this is that disclosure.
+
+    Strong match. You have Python and Django, and nothing it asks for is
+    missing from your resume. Based on only 2 stated requirements, so treat
+    it as a rough signal.
+
+**Unreadable postings.** The unparsed bucket gets its own text, and deliberately
+makes no claim about skills:
+
+    This posting's requirements could not be read, so nothing was checked
+    against your skills. The score reflects overall similarity to your
+    background only.
+
+The top of that bucket scores 0.999 on semantics alone. Saying "strong match"
+there would be a lie, which is the same reason `tier` is None for it (31.6).
+
+Skills are capped at five with "and N more" — a Director-SDET posting has
+nineteen requirements, and listing all of them turns a card into a wall of nouns.
+
+## 33. CORS
+
+`CORSMiddleware` allowing `http://localhost:5173` (Vite dev server), all methods,
+all headers, `allow_credentials=False`.
+
+Origins are read from `Settings.cors_origins` (comma-separated, same default) so
+a deploy is a config change rather than a code change. Credentials stay off
+because the API has no auth and sets no cookies — and `allow_credentials=True`
+with wildcard methods and headers is a combination browsers reject anyway.
+
+Verified: preflight from `localhost:5173` returns
+`access-control-allow-origin: http://localhost:5173`; an unlisted origin gets no
+allow-origin header at all.
+
+## 34. `TIER_MODERATE` stays 0.25 — corrected rationale
+
+**The original rationale was wrong and is corrected here rather than quietly
+dropped.** The claim was that the median is "where the corpus turns from Python
+roles into sales and marketing jobs". It is not. Engineering-titled share is
+flat at 65-67% from 0.20 through 0.36; the composition boundary is at **0.20**,
+below which it falls to 39% and then 11%. The five-row window straddling 0.25
+that suggested otherwise was a sampling artefact.
+
+**0.25 is kept for a different and better reason**, and it is a judgement rather
+than a measurement: *moderate* means "worth improving", and a 0.20-0.25 match
+resting on one or two stated requirements is not worth a candidate's time. A
+conservative amber band is the right error to make — telling someone a job is
+worth pursuing when it is not costs them more than the reverse.
+
+Recorded so the number is visibly a choice. The measured composition boundary of
+0.20 sits alongside it; anyone revisiting this should know that moving the line
+there would widen *moderate* without changing the technical/non-technical mix at
+all.
+
+## 35. Re-deriving thresholds: measure after fixing the cosine band
+
+Repeated here because it is the easiest mistake to make with this data.
+
+The tier cutoffs were derived from an `overall_score` distribution computed with
+the **placeholder** cosine bounds. Freezing `COS_LO/COS_HI` at 0.53/0.69
+rescaled every semantic score and therefore every overall score:
+
+| | before freeze | after |
+|---|---|---|
+| p50 | 0.2292 | 0.2878 |
+| p75 | **0.3601** | 0.4398 |
+| p95 | 0.5431 | 0.6796 |
+
+`TIER_STRONG = 0.36` was the *old* p75; against the current distribution it sits
+nearer the p60. Tier sizes remain healthy (37 / 21 / 42%), so the frozen values
+stand — but **anyone re-deriving thresholds must re-measure after the cosine
+band is fixed, not before.** Doing it in the other order silently bakes in a
+band that is about to move.
+
+---
+
+**Backend is closed at this commit.** Open items, both documented and
+deliberately not acted on: the confidence asymmetry (30.1, now disclosed in the
+explanation text) and the Adzuna boilerplate records (30.4).

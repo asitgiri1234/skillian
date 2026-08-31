@@ -96,6 +96,24 @@ class Settings(BaseSettings):
     # decoding fixes shape, not accuracy, so retries are about semantic failures.
     extraction_max_attempts: int = Field(default=3, ge=1, le=6)
 
+    # --- Explanations -----------------------------------------------------
+    # "template" | "llm". Templates render every match in microseconds from
+    # stored fields; the LLM path costs 8-30s per job and is therefore capped at
+    # 20, which leaves most cards blank. Templates also disclose thin evidence
+    # and unreadable postings, neither of which the model can see. See
+    # DECISIONS 32.1.
+    explanation_mode: str = "template"
+
+    # --- HTTP / CORS ------------------------------------------------------
+    # Comma-separated origins allowed to call the API from a browser. Default is
+    # the Vite dev server. Read from config rather than hardcoded so a deploy
+    # does not need a code change.
+    cors_origins: str = "http://localhost:5173"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
     log_level: str = "INFO"
 
 

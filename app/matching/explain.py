@@ -144,3 +144,91 @@ def explain_match(
         logger.warning("Explanation for %r was empty after cleanup", job_title)
         return None
     return explanation
+
+
+# --- templated explanations -------------------------------------------------
+#
+# Every match needs a reason on screen, and the LLM explainer above cannot
+# supply one: at 8-30s per job it is capped at 20 matches, which leaves 306 of
+# 326 cards blank. These templates render in microseconds for the whole corpus.
+#
+# They also say two things the LLM path could not, because both come from
+# numbers the model never sees: how much evidence the score rests on, and
+# whether the posting was readable at all.
+
+#: Skills listed before eliding. Beyond five, a card becomes a wall of nouns.
+MAX_LISTED_SKILLS = 5
+
+#: parsed_count at or below which the explanation must disclose thin evidence.
+#: Tied to skill_confidence: 1 requirement weighs 0.41, 2 weighs 0.58, and a
+#: reader deserves to know a "strong match" rests on one line of a job ad.
+#: See DECISIONS 30.1 and 32.2.
+THIN_EVIDENCE_MAX = 2
+
+
+def _join(names: list[str], limit: int = MAX_LISTED_SKILLS) -> str:
+    """Human list with an Oxford-free 'and', eliding past ``limit``."""
+    shown = [n for n in names if n][:limit]
+    extra = max(0, len([n for n in names if n]) - len(shown))
+    if not shown:
+        return ""
+    if extra:
+        return ", ".join(shown) + f" and {extra} more"
+    if len(shown) == 1:
+        return shown[0]
+    return ", ".join(shown[:-1]) + f" and {shown[-1]}"
+
+
+def _evidence_clause(parsed_count: int | None) -> str:
+    """Disclose thin evidence, or say nothing."""
+    if not parsed_count or parsed_count > THIN_EVIDENCE_MAX:
+        return ""
+    noun = "requirement" if parsed_count == 1 else "requirements"
+    return f" Based on only {parsed_count} stated {noun}, so treat it as a rough signal."
+
+
+def render_explanation(
+    *,
+    tier: str | None,
+    matching_skills: list[str] | None,
+    missing_skills: list[str] | None,
+    parsed_count: int | None = None,
+    skills_unparsed: bool = False,
+) -> str:
+    """Build a match explanation from stored fields. No model call.
+
+    Deterministic, so the same match always reads the same way — a re-run must
+    not silently reword every card and make two identical runs look different.
+    """
+    matched = _join(matching_skills or [])
+    missing = _join(missing_skills or [])
+
+    if skills_unparsed:
+        # tier is None here by design (DECISIONS 31.6): there is nothing to
+        # grade, so the explanation states what the score does and does not mean.
+        return (
+            "This posting's requirements could not be read, so nothing was "
+            "checked against your skills. The score reflects overall similarity "
+            "to your background only."
+        )
+
+    if tier == "strong":
+        if missing:
+            return f"Strong match. You have {matched}. It also asks for {missing}." + _evidence_clause(parsed_count)
+        return f"Strong match. You have {matched}, and nothing it asks for is missing from your resume." + _evidence_clause(parsed_count)
+
+    if tier == "moderate":
+        if matched and missing:
+            return f"Decent match. You have {matched}, but adding {missing} would strengthen your fit." + _evidence_clause(parsed_count)
+        if matched:
+            return f"Decent match. You have {matched}." + _evidence_clause(parsed_count)
+        return f"Decent match on overall fit, though none of its stated requirements — {missing} — are on your resume." + _evidence_clause(parsed_count)
+
+    # weak, or an unrecognised tier.
+    if missing and matched:
+        return f"Weak fit. You have {matched}, but this role also needs {missing}." + _evidence_clause(parsed_count)
+    if missing:
+        # Number agreement: "SEO, which isn't" vs "Salesforce and SEO, which aren't".
+        verb = "isn't" if len([n for n in (missing_skills or []) if n]) == 1 else "aren't"
+        return f"Weak fit. This role needs {missing}, which {verb} on your resume." + _evidence_clause(parsed_count)
+    return "Weak fit. Little overlap between this posting and your resume." + _evidence_clause(parsed_count)

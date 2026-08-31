@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import resumes, searches
 from app.config import get_settings
@@ -26,6 +27,19 @@ app = FastAPI(
     title="Skillian",
     description="Job scraper and resume matcher.",
     version="0.3.0",
+)
+
+# Browser clients are served from a different origin in development (Vite on
+# 5173, API on 8000), so without this every request fails at preflight.
+# allow_credentials is False: the API has no auth and sets no cookies, and
+# "*" methods/headers with credentials enabled is a combination browsers reject
+# anyway. Origins come from config — see Settings.cors_origins.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(resumes.router)

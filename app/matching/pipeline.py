@@ -38,10 +38,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import runs as run_status
+from app.config import get_settings
 from app.db import SessionLocal
 from app.ingest import upsert_job  # single definition of the jobs upsert
 from app.matching.chunking import chunk_description
-from app.matching.explain import MAX_EXPLANATIONS, explain_match
+from app.matching.explain import (
+    MAX_EXPLANATIONS,
+    explain_match,
+    render_explanation,
+)
 from app.matching.queries import build_search_queries
 from app.matching.scorer import (
     SCORER_VERSION,
@@ -488,19 +493,55 @@ def _write_matches(
 # --- stage h ----------------------------------------------------------------
 
 
-def _explain_top(
+def _explain_matches(
     session: Session,
     resume_id: UUID,
     scored: list[tuple[UUID, ScoreResult]],
     profile: ResumeProfile,
     llm: LLMProvider,
+    mode: str = "template",
     limit: int = MAX_EXPLANATIONS,
 ) -> int:
-    """Explain the highest-scoring matches, updating those rows in place."""
-    top = sorted(scored, key=lambda pair: pair[1].overall_score, reverse=True)[:limit]
-    if not top:
+    """Write an explanation for every match (templates) or the top N (LLM).
+
+    Templates are the default and cover the whole result set, because a match
+    card with a score and no reason is not an explanation. The LLM path renders
+    richer prose but costs 8-30s per job, so it stays capped — which left 306 of
+    326 cards blank on the real corpus. See DECISIONS 32.1.
+    """
+    if not scored:
         return 0
 
+    if mode == "template":
+        rows = [
+            {
+                "resume_id": resume_id,
+                "job_id": job_id,
+                "explanation": render_explanation(
+                    tier=result.tier,
+                    matching_skills=result.matching_skills,
+                    missing_skills=result.missing_skills,
+                    parsed_count=result.parsed_count,
+                    skills_unparsed=result.skills_unparsed,
+                ),
+            }
+            for job_id, result in scored
+        ]
+        # One statement for the whole set: rendering is microseconds, so the
+        # per-item commit that protected minutes of model time buys nothing.
+        stmt = pg_insert(Match).values(rows)
+        session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["resume_id", "job_id"],
+                set_={"explanation": stmt.excluded.explanation},
+            )
+        )
+        session.commit()
+        logger.info("Rendered %s templated explanation(s)", len(rows))
+        return len(rows)
+
+    # --- llm mode: the top N only ------------------------------------------
+    top = sorted(scored, key=lambda pair: pair[1].overall_score, reverse=True)[:limit]
     jobs = {
         job.id: job
         for job in session.execute(
@@ -532,12 +573,11 @@ def _explain_top(
             .where(Match.resume_id == resume_id, Match.job_id == job_id)
             .values(explanation=explanation)
         )
-        # Per row, for the same reason as stage d: each of these cost real
-        # seconds and must survive a crash on the next one.
+        # Per row: each of these cost real seconds and must survive a crash.
         session.commit()
         written += 1
 
-    logger.info("Wrote %s explanation(s)", written)
+    logger.info("Wrote %s LLM explanation(s)", written)
     return written
 
 
@@ -610,8 +650,9 @@ def run_search(
         outcome.matches_written = _write_matches(session, resume_id, scored)
 
         _set_stage(session, run_id, run_status.STAGE_EXPLAINING)
-        outcome.explanations_written = _explain_top(
-            session, resume_id, scored, profile, llm
+        outcome.explanations_written = _explain_matches(
+            session, resume_id, scored, profile, llm,
+            mode=get_settings().explanation_mode,
         )
 
         # Partial, not succeeded, when a source failed but others delivered —

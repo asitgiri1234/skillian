@@ -146,12 +146,14 @@ def main() -> int:
     print(f"   {PASS} completed in {extract_seconds:.2f}s")
     print(f"   {INFO} name      {parsed.name}")
     print(f"   {INFO} email     {parsed.email}")
-    print(f"   {INFO} location  {parsed.location}")
-    print(f"   {INFO} years     {parsed.total_years_experience}")
+    print(f"   {INFO} years     {parsed.total_experience_years}")
     print(f"   {INFO} skills    {len(parsed.skills)}: {', '.join(parsed.skills[:8])}")
     print(f"   {INFO} roles     {len(parsed.experience)}")
     for entry in parsed.experience[:3]:
-        print(f"            - {entry.title} @ {entry.company} ({entry.start_date} - {entry.end_date})")
+        print(f"            - {entry.role} @ {entry.company} ({entry.duration})")
+    print(f"   {INFO} projects  {len(parsed.projects)}")
+    for project in parsed.projects[:3]:
+        print(f"            - {project.title} ({', '.join(project.tech[:5])})")
     print(f"   {INFO} education {len(parsed.education)}")
     print()
 

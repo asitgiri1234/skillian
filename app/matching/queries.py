@@ -71,7 +71,9 @@ def _titles(parsed: dict[str, Any]) -> list[str]:
     for entry in parsed.get("experience") or []:
         if not isinstance(entry, dict):
             continue
-        raw = (entry.get("title") or "").strip()
+        # "role" since the schema trim; ExperienceRef replaced ExperienceEntry
+        # and renamed this field. See DECISIONS 20.
+        raw = (entry.get("role") or "").strip()
         if not raw:
             continue
         cleaned = _clean_title(raw)

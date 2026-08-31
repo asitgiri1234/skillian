@@ -130,21 +130,19 @@ PARSED = {
     "name": "Test Candidate",
     "email": "candidate@test.invalid",
     "phone": None,
-    "location": "Bengaluru",
-    "summary": "Backend engineer working on distributed services.",
+    "total_experience_years": 6.0,
     "skills": ["Python", "PostgreSQL", "Docker"],
+    "projects": [
+        {"title": "Ledger reconciliation", "tech": ["Python", "PostgreSQL"]}
+    ],
     "experience": [
         {
             "company": "Globex",
-            "title": "Senior Backend Engineer",
-            "start_date": "2021",
-            "end_date": "Present",
-            "is_current": True,
-            "summary": "Built and operated Python services on PostgreSQL.",
+            "role": "Senior Backend Engineer",
+            "duration": "2021 - Present",
         }
     ],
     "education": [],
-    "total_years_experience": 6.0,
 }
 
 

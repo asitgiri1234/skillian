@@ -151,7 +151,11 @@ def _load_resume_profile(session: Session, resume_id: UUID) -> tuple[ResumeProfi
         ).scalars()
     )
     parsed = resume.parsed or {}
-    years = parsed.get("total_years_experience")
+    # Renamed from total_years_experience when the schema was trimmed; a
+    # resume parsed before that change reads as None here and simply scores
+    # with experience_multiplier == 1.0, which is the documented behaviour for
+    # missing data rather than a wrong answer. See DECISIONS 20.5.
+    years = parsed.get("total_experience_years")
 
     profile = ResumeProfile(
         resume_id=resume_id,

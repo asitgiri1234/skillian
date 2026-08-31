@@ -260,6 +260,49 @@ fake emails, duplicate skills, implausible years, and — most importantly — a
 well-formed result with no skills and no experience, which means extraction
 failed. On a validation failure the errors are fed back into the next prompt.
 
+## Extraction: why the schema has no prose in it
+
+`ParsedResume` returns identifiers and short labels only — no `summary`, no
+`description`. That is not minimalism, it is the fix for a measured latency
+problem, and the reasoning is worth knowing before anyone adds a field back.
+
+`scripts/benchmark_llm.py` isolated the cost by adding one variable at a time:
+
+| | Time | Out tokens |
+|---|---|---|
+| Trivial generation ("reply with one word") | 0.39s | ~1 |
+| 600w resume, **no schema at all** | 253.9s | 958 |
+| Full schema, **100w input** | 68.1s | 275 |
+| Full schema, 600w input | 217.1s | 941 |
+
+**Time tracks output token count and nothing else** — a flat ~4 tokens/sec
+across every row. Input size is irrelevant (222 vs 1029 input tokens, same
+~68s). Schema nesting is irrelevant. And constrained decoding is *negative*
+cost: dropping the schema made the same job **slower** (254s vs 217s), because
+without a grammar the model adds preamble. So `format=` and `temperature=0`
+stay.
+
+Splitting the schema into two calls was measured and **rejected** — 205s
+sequential, 174s concurrent, against 217s whole. The halves emit the same total
+tokens, so at a fixed tok/s the total cannot move.
+
+The only lever is emitting fewer tokens. The removed prose fields were the model
+transcribing text that already sits verbatim in `resumes.raw_text`, which is
+stored and free to read. Result: **941 → 483 tokens, 217s → 101s (2.15x)** at
+unchanged throughput, with no loss of extracted skills.
+
+```bash
+python scripts/benchmark_llm.py --verify-trim   # re-measure and assert quality
+python scripts/benchmark_llm.py --repeats 3     # the full ladder
+```
+
+`--verify-trim` asserts skill recall, not just the clock: a fast extraction that
+loses skills is worse than a slow one, because skills carry 60% of every score.
+
+**Known cost:** the resume embedding text roughly halved (1142 → 618 chars) and
+is now mostly nouns. Re-run `calibrate_similarity.py` before trusting
+`COS_LO`/`COS_HI`. See DECISIONS 20-21.
+
 ## Adding a source
 
 1. Write `app/sources/<name>.py` with a class subclassing `JobSource`, setting

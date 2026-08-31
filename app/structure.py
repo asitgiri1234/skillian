@@ -66,57 +66,122 @@ def _clean_optional(value: str | None) -> str | None:
     return value.strip()
 
 
-class ExperienceEntry(BaseModel):
-    """One role. Dates stay free text — resumes write them a dozen ways
-    ("Jan 2020", "2020-01", "Spring 2020") and a wrong ISO date is worse than
-    the original string."""
+def _clean_required(value: str | None) -> str:
+    """Placeholder-strip a non-nullable field down to "" rather than None.
 
-    # All required, all nullable. See the note on ParsedResume.skills: a field
-    # with a default is absent from the schema's "required" list, and the model
-    # then simply omits it. Required-and-nullable forces the key to be emitted
-    # with an explicit null, which is a real answer; a missing key is not.
-    company: str | None = Field(description="Employer name")
-    title: str | None = Field(description="Job title held")
-    start_date: str | None = Field(description="Start date exactly as written")
-    end_date: str | None = Field(description="End date as written, or 'Present'")
-    is_current: bool = Field(description="True if this is the candidate's current role")
-    summary: str | None = Field(description="What the candidate did in this role")
+    The Ref models below use bare ``str`` where the old ones used ``str | None``,
+    because a nullable field lets the grammar emit ``null`` and a null costs
+    tokens for no information. "" is the empty case here, and the list
+    validators on ParsedResume drop entries that are empty in every field.
+    """
+    return "" if _is_placeholder(value) else (value or "").strip()
 
-    @field_validator("company", "title", "start_date", "end_date", "summary", mode="after")
+
+class ProjectRef(BaseModel):
+    """A project, as a pointer rather than a description.
+
+    ``description`` is deliberately absent — see the note on ParsedResume.
+    """
+
+    title: str = Field(description="Project name, as written")
+    tech: list[str] = Field(description="Technologies used, one per item")
+
+    @field_validator("title", mode="after")
     @classmethod
-    def _strip_placeholders(cls, value: str | None) -> str | None:
+    def _clean_title(cls, value: str) -> str:
+        return _clean_required(value)
+
+    @field_validator("tech", mode="after")
+    @classmethod
+    def _clean_tech(cls, values: list[str]) -> list[str]:
+        return _dedupe_labels(values)
+
+
+class ExperienceRef(BaseModel):
+    """One role, as three short labels.
+
+    ``summary`` is gone. ``duration`` replaces the old start/end/is_current
+    trio: it is one field instead of three, it stays free text because resumes
+    write dates a dozen ways, and it is copied verbatim rather than reasoned
+    about.
+    """
+
+    company: str = Field(description="Employer name")
+    role: str = Field(description="Job title held")
+    duration: str = Field(description="Dates as written, e.g. '2021 - Present'")
+
+    @field_validator("company", "role", "duration", mode="after")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return _clean_required(value)
+
+
+class EducationRef(BaseModel):
+    institution: str = Field(description="School or university name")
+    degree: str = Field(description="Degree awarded, e.g. 'B.E. Computer Science'")
+    year: str | None = Field(description="Graduation year as written")
+
+    @field_validator("institution", "degree", mode="after")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return _clean_required(value)
+
+    @field_validator("year", mode="after")
+    @classmethod
+    def _clean_year(cls, value: str | None) -> str | None:
         return _clean_optional(value)
 
 
-class EducationEntry(BaseModel):
-    institution: str | None = Field(description="School or university name")
-    degree: str | None = Field(description="Degree awarded, e.g. 'B.E.'")
-    field_of_study: str | None = Field(description="Subject studied")
-    graduation_year: int | None = Field(description="Four-digit year of graduation")
+def _dedupe_labels(values: list[str]) -> list[str]:
+    """Drop placeholders and case-insensitive duplicates, preserving order.
 
-    @field_validator("institution", "degree", "field_of_study", mode="after")
-    @classmethod
-    def _strip_placeholders(cls, value: str | None) -> str | None:
-        return _clean_optional(value)
-
-    @field_validator("graduation_year", mode="after")
-    @classmethod
-    def _plausible_year(cls, value: int | None) -> int | None:
-        # Outside this range it is a page number or a hallucination, not a year.
-        if value is not None and not (1950 <= value <= 2100):
-            return None
-        return value
+    Shared by ``skills`` and ``ProjectRef.tech``: JSON schema can express
+    "array of strings" but not "no duplicates, no junk".
+    """
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for value in values:
+        if _is_placeholder(value):
+            continue
+        label = value.strip()
+        # A whole sentence is a description the model mislabelled as a skill.
+        if len(label) > 60:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(label)
+    return cleaned
 
 
 class ParsedResume(BaseModel):
     """The extraction target. This class *is* the prompt — its field names and
-    descriptions are what the model sees via the JSON schema."""
+    descriptions are what the model sees via the JSON schema.
+
+    **Every field here is an identifier or a short label. None of it is prose,
+    and that is the point.**
+
+    Extraction was measured at ~217s warm for a 600-word resume. The breakdown
+    (scripts/benchmark_llm.py) showed generation runs at a flat ~4 tokens/sec
+    and that wall-clock scales with *output token count only* — input size,
+    schema nesting and constrained decoding were all ruled out, the last of
+    those by an unconstrained run that came out slower (254s) than the
+    constrained one. So the only lever is emitting fewer tokens.
+
+    The removed fields — ``ExperienceEntry.summary``, ``ProjectRef.description``,
+    the top-level ``summary`` — were the bulk of the ~950 output tokens, and
+    every one of them was the model *transcribing prose that already exists
+    verbatim in* ``resumes.raw_text``. Anything long needed for display is read
+    from there. See DECISIONS 20.
+    """
 
     name: str | None = Field(description="Candidate's full name")
     email: str | None = Field(description="Primary email address")
     phone: str | None = Field(description="Primary phone number")
-    location: str | None = Field(description="City and country of residence")
-    summary: str | None = Field(description="Professional summary or objective")
+    total_experience_years: float | None = Field(
+        ge=0, le=60, description="Total years of professional experience"
+    )
 
     # Required — deliberately no default. Pydantic only marks a field "required"
     # in the JSON schema when it has no default, and the grammar built from that
@@ -124,23 +189,45 @@ class ParsedResume(BaseModel):
     # qwen2.5:3b returned a valid object containing only name/location/education
     # and skipped the two fields that matter. Requiring them makes omission
     # unrepresentable rather than merely undesirable.
+    #
+    # skills is kept in full even though it is the longest list: it is the
+    # single input to the skill component of every match score.
     skills: list[str] = Field(
         description="Technical and professional skills, one per item",
     )
-    experience: list[ExperienceEntry] = Field(
+    projects: list[ProjectRef] = Field(
+        description="Named projects, with the technologies each used"
+    )
+    experience: list[ExperienceRef] = Field(
         description="Work history, most recent first"
     )
-    education: list[EducationEntry] = Field(
+    education: list[EducationRef] = Field(
         description="Degrees and qualifications"
     )
-    total_years_experience: float | None = Field(
-        ge=0, le=60, description="Total years of professional experience"
-    )
 
-    @field_validator("name", "phone", "location", "summary", mode="after")
+    @field_validator("name", "phone", mode="after")
     @classmethod
     def _strip_placeholders(cls, value: str | None) -> str | None:
         return _clean_optional(value)
+
+    @field_validator("projects", mode="after")
+    @classmethod
+    def _drop_untitled_projects(cls, values: list[ProjectRef]) -> list[ProjectRef]:
+        """A project with no title is not a project — it is the model filling
+        the array because the grammar allowed it."""
+        return [project for project in values if project.title]
+
+    @field_validator("experience", mode="after")
+    @classmethod
+    def _drop_empty_roles(cls, values: list[ExperienceRef]) -> list[ExperienceRef]:
+        """Keep a role if it names either an employer or a title. Dropping only
+        on both being empty, since plenty of resumes omit one."""
+        return [entry for entry in values if entry.company or entry.role]
+
+    @field_validator("education", mode="after")
+    @classmethod
+    def _drop_empty_education(cls, values: list[EducationRef]) -> list[EducationRef]:
+        return [entry for entry in values if entry.institution or entry.degree]
 
     @field_validator("email", mode="after")
     @classmethod
@@ -159,26 +246,7 @@ class ParsedResume(BaseModel):
     @field_validator("skills", mode="after")
     @classmethod
     def _clean_skills(cls, values: list[str]) -> list[str]:
-        """Drop placeholders and de-duplicate case-insensitively, preserving order.
-
-        JSON schema can express "array of strings" but not "no duplicates, no
-        junk" — exactly the gap this loop exists to cover.
-        """
-        seen: set[str] = set()
-        cleaned: list[str] = []
-        for value in values:
-            if _is_placeholder(value):
-                continue
-            skill = value.strip()
-            # A whole sentence is a description the model mislabelled as a skill.
-            if len(skill) > 60:
-                continue
-            key = skill.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(skill)
-        return cleaned
+        return _dedupe_labels(values)
 
     @model_validator(mode="after")
     def _must_extract_something(self) -> "ParsedResume":
@@ -198,7 +266,7 @@ class ParsedResume(BaseModel):
 
 
 def build_resume_embedding_text(parsed: "ParsedResume | dict[str, Any]") -> str:
-    """The text a resume's embedding is built from: skills and experience only.
+    """The text a resume's embedding is built from: skills, roles and project tech.
 
     Deliberately **not** ``raw_text``. A resume's raw text is mostly things that
     say nothing about employability — a postal address, a phone number, hobbies,
@@ -209,7 +277,20 @@ def build_resume_embedding_text(parsed: "ParsedResume | dict[str, Any]") -> str:
 
     Education is excluded for the same reason: a degree title matches every
     posting's boilerplate degree requirement about equally, so it adds distance
-    to no one. Skills and what the candidate actually *did* are the signal.
+    to no one.
+
+    **This text is thinner than it was.** It previously included each role's
+    ``summary`` — a sentence or two of what the candidate actually did, which
+    was the most job-description-like prose available. Those fields were removed
+    from the schema because they were the bulk of a 950-token, 217-second
+    extraction (see the ParsedResume docstring). What is left is nouns: skill
+    names, job titles, employers, project names and project technologies. Nouns
+    embed further from a job description's prose than prose does, so expect the
+    resume-to-job cosine band to shift, and re-run
+    ``scripts/calibrate_similarity.py`` before trusting COS_LO/COS_HI. This is a
+    real trade, made knowingly: extraction is 4x faster and the skill component
+    — which carries 60% of the score and is the half a candidate can act on — is
+    unaffected, because ``skills`` was kept in full. See DECISIONS 20.4.
 
     Accepts either a :class:`ParsedResume` or the JSONB dict read back from
     ``resumes.parsed``, so the API can call it without a re-validation round
@@ -236,24 +317,35 @@ def build_resume_embedding_text(parsed: "ParsedResume | dict[str, Any]") -> str:
     for entry in data.get("experience") or []:
         if not isinstance(entry, dict):
             continue
-        # Title and company describe the role; the summary describes the work.
-        # Dates are dropped — "Jan 2020 - Present" is noise under cosine.
-        headline = " at ".join(
-            part for part in (entry.get("title"), entry.get("company")) if part
+        # Role and employer only. `duration` is dropped — "2021 - Present" is
+        # noise under cosine, exactly as the old start/end dates were.
+        line = " at ".join(
+            part
+            for part in (entry.get("role"), entry.get("company"))
+            if part and str(part).strip()
         )
-        summary = (entry.get("summary") or "").strip()
-        line = ". ".join(part for part in (headline, summary) if part)
         if line:
             role_lines.append(line)
     if role_lines:
-        sections.append("Experience:\n" + "\n".join(role_lines))
+        sections.append("Roles: " + "; ".join(role_lines))
 
-    # The professional summary is the candidate's own description of their work,
-    # so it belongs with experience. Included last: it is often absent, and when
-    # present it is the most boilerplate-prone field on the page.
-    summary = (data.get("summary") or "").strip()
-    if summary:
-        sections.append("Summary: " + summary)
+    # Projects are the closest thing left to evidence of *what the candidate
+    # did*, and their tech lists are the closest thing to a second skills
+    # section — often naming tools the skills list omits.
+    project_lines: list[str] = []
+    for entry in data.get("projects") or []:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        tech = [str(t).strip() for t in (entry.get("tech") or []) if str(t).strip()]
+        if not title and not tech:
+            continue
+        if title and tech:
+            project_lines.append(f"{title} ({', '.join(tech)})")
+        else:
+            project_lines.append(title or ", ".join(tech))
+    if project_lines:
+        sections.append("Projects: " + "; ".join(project_lines))
 
     return "\n\n".join(sections).strip()
 

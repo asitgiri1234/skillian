@@ -1301,3 +1301,222 @@ hundred postings, re-run the script, and set the two constants from p5/p95.
   but has not been run.
 - **Scale.** The largest run tested is 25 jobs. The N+1-avoiding bulk loads in
   `_load_postings` were written for 200+ but have not been measured there.
+
+---
+
+# Decisions — Day 3b (extraction latency)
+
+One change, driven entirely by measurement: the extraction schema no longer asks
+the model to write prose. Everything here is a number first and an opinion
+second, because the obvious guesses were all wrong.
+
+---
+
+## 20. Extraction latency
+
+### 20.1 The measurement, before any change
+
+Resume extraction took ~217s warm for a 600-word resume (170s was the earlier
+cold figure that started this). `scripts/benchmark_llm.py` isolated the cause by
+adding one variable at a time. All figures warm, same machine, same model
+(`qwen2.5:7b`), same 600-word fixture:
+
+| Test | Time | In | Out |
+|---|---|---|---|
+| Trivial generation, no schema ("reply with one word") | 0.39s | — | ~1 |
+| 600w resume, **no schema at all**, free-form JSON asked | 253.9s | 1074 | 958 |
+| Full schema, **100-word input** | 68.1s | 222 | 275 |
+| **Flat half-schema** (ContactAndSkills), 600w input | 67.9s | 1029 | 295 |
+| Full schema, 600w input | 217.1s | 1029 | 941 |
+
+**Time scales with output token count and nothing else.** Divide every row
+through and the rate is 0.23-0.26s per output token — a flat **~4 tokens/sec**
+across all five. Nothing else correlates:
+
+- **Input size is irrelevant.** 222 input tokens and 1029 input tokens both took
+  ~68s, a 4.6x difference in input for a 0.3% difference in time, because both
+  emitted ~285 output tokens.
+- **Schema nesting is irrelevant.** The flat half-schema took the same ~68s as
+  the deeply-nested small-input run, again because output volume matched.
+- **Constrained decoding is not merely free, it is negative.** Removing the
+  schema entirely made the same extraction *slower* — 254s against 217s —
+  because without a grammar the model adds preamble and prose it would otherwise
+  be forbidden from emitting. This is the result that surprised me most, and it
+  is why `format=` and `temperature=0` are kept.
+
+### 20.2 The 0.39s baseline was misleading, and I read it wrong the first time
+
+An earlier pass measured warm trivial generation at 0.39s and I concluded "the
+hardware is fine, keep it local". That was wrong: a one-token reply measures
+prompt latency, not throughput. At 4 tok/s a 7B model is slow — that is
+CPU-only inference — and the correct reading is that the machine is slow *and*
+the output was enormous, with the second factor being the one we control.
+Recorded because the mistake is instructive: never infer throughput from a
+single-token response.
+
+### 20.3 The split was measured and rejected
+
+Splitting `ParsedResume` into two calls was the obvious fix and it does not
+work. Sequential: 205s. Concurrent on two threads: 174s. Against 217s for the
+single call. The reason is arithmetic — the two halves emit the same total
+tokens as the whole, so at a fixed 4 tok/s the total time cannot move. The
+concurrent run's modest gain is Ollama overlapping one request's prompt
+evaluation with the other's generation, not real parallelism; it does not
+serialise perfectly, but it does not parallelise either, and it doubles peak
+memory to buy ~20%.
+
+**Rejected. The only lever is fewer tokens.**
+
+### 20.4 Prose fields removed; `raw_text` is where prose lives
+
+The model was transcribing text that already exists verbatim in
+`resumes.raw_text`, which is stored, unchanged, and free to read. So the schema
+now returns identifiers and short labels only:
+
+| Removed | Was |
+|---|---|
+| `ExperienceEntry.summary` | a sentence or two per role — the single largest contributor |
+| top-level `summary` | the professional-summary paragraph |
+| `ProjectRef.description` | never shipped; excluded from the new schema by the same rule |
+| `start_date` / `end_date` / `is_current` | three fields collapsed to one free-text `duration` |
+| `location`, `field_of_study` | short, but nothing reads them |
+
+`skills` is kept **in full** and deliberately untouched. It is the sole input to
+the skill component, which carries 60% of every match score and is the half a
+candidate can act on. A faster extraction that lost skills would be a worse
+system, not a better one, which is why `--verify-trim` asserts skill recall
+rather than only timing.
+
+Renames: `total_years_experience` -> `total_experience_years`,
+`ExperienceEntry` -> `ExperienceRef` (`title` -> `role`), `EducationEntry` ->
+`EducationRef` (`graduation_year: int` -> `year: str | None`). New:
+`ProjectRef(title, tech)`.
+
+The `Ref` models use bare `str` rather than `str | None` where the old ones were
+nullable. A nullable field lets the grammar emit `null`, and a `null` costs
+tokens to say nothing; `""` is the empty case instead, and list-level validators
+drop entries that are empty in every field.
+
+### 20.5 What this costs: the resume embedding is thinner
+
+`build_resume_embedding_text()` previously included each role's `summary` — the
+most job-description-like prose available anywhere in the parse. That is gone.
+It now builds from skills, role titles, employers, project titles and project
+tech. **This is a real loss of semantic signal and it should not be read as a
+free win.**
+
+Two mitigations, neither of which fully replaces prose:
+
+- `projects[].tech` is new, and often names tools the skills list omits.
+- The skill component — 60% of the score — is completely unaffected.
+
+The consequence to watch: the embedded text is now mostly nouns, and nouns embed
+further from a job description's prose than prose does. The resume-to-job cosine
+band will have moved, so **`COS_LO`/`COS_HI` must be re-derived** with
+`scripts/calibrate_similarity.py` before the semantic component is trusted —
+they were already uncalibrated placeholders (19.3), and this makes the existing
+values staler rather than newly wrong.
+
+### 20.6 Stored resumes parsed before this change are stale
+
+`resumes.parsed` is JSONB, so there is no migration and nothing errors. But a
+row written under the old schema has `total_years_experience` and
+`experience[].title`, and the new readers look for `total_experience_years` and
+`experience[].role`. Those reads return `None`, which degrades gracefully —
+`experience_multiplier` returns 1.0 for missing data by design, and
+`build_search_queries` falls back to skills — but the resume is quietly matching
+on less than it should.
+
+**Old rows need re-parsing.** Not automated here: there is one such row in this
+database, and a backfill for a one-row table would be ceremony. It is a real
+migration task the moment there is real data.
+
+### 20.7 Two levers not taken
+
+- **A smaller model (`qwen2.5:3b`).** Would raise tokens/sec, and the 3b model
+  is already pulled. Not taken because day 2 chose 7b specifically for
+  extraction accuracy on messy resume text (13.1), and the trim already
+  addresses the latency without touching quality. This is the right next lever
+  *if* latency is still a problem, and it should be measured against skill
+  recall, not just the clock.
+- **GPU offload.** 4 tok/s is CPU-only inference; a GPU would move throughput by
+  an order of magnitude and is by far the largest available win. Not taken
+  because it is a hardware/deployment change, not a code change, and nothing in
+  the codebase would differ.
+
+Both remain open. The trim was chosen first because it is the only one of the
+three that costs nothing at run time and is portable to whatever hardware this
+eventually runs on.
+
+---
+
+## 21. Verification of the trim (day 3b)
+
+`python scripts/benchmark_llm.py --verify-trim`, same 600-word fixture, same
+model, warm. Run twice, because the first run's throughput did not match the
+baseline's and that made it uninterpretable.
+
+| | Baseline | Run 1 | Run 2 |
+|---|---|---|---|
+| Output tokens | 941 | **483** | **483** |
+| Wall clock | 217.1s | 146.6s | **100.9s** |
+| Throughput | 4.33 tok/s | 3.30 tok/s | 4.79 tok/s |
+| Speedup | — | 1.48x | **2.15x** |
+
+**The fix worked, and it worked in proportion.** Run 2 is the valid comparison:
+its throughput (4.79 tok/s) is within noise of the baseline's 4.33, so the
+change in wall clock is attributable to the change in output volume. **51% of
+the tokens, 46% of the time** — proportional, slightly better.
+
+### 21.1 Run 1 was discarded on evidence, not on preference
+
+Run 1 came in at 146.6s / 3.30 tok/s — a 24% slower machine state than the
+baseline was measured at. That is a confound, not a result, and the script says
+so itself rather than quietly reporting the ratio:
+
+    -> CHANGED: machine state differs, speedup not attributable
+
+Both runs are recorded here because discarding the less convenient of two
+numbers is only legitimate if the discarded one is visible. Note also that the
+output token count was **identical across both runs (483)** — `temperature=0`
+makes extraction deterministic, so token count is a stable measurement and
+wall clock is the noisy one. That is what makes the throughput check able to
+separate them at all.
+
+### 21.2 Output tokens landed at 483, not the estimated 200-250
+
+The estimate was wrong; the change was not. Removing prose removed prose. What
+remains is still substantial because this fixture has a genuinely long skills
+section and the model returned **27 skills**, four roles, two projects and one
+education entry. `skills` is now the largest remaining contributor and is kept
+in full deliberately (20.4) — it feeds 60% of every match score. Reaching 200
+tokens would have meant trimming skills, i.e. trading match quality for latency,
+which is the wrong trade.
+
+So: the target of 50-65s was not met. **100.9s is the real number**, from 217.1s.
+
+### 21.3 Extraction quality did not degrade
+
+This mattered more than the clock, and is why `--verify-trim` asserts
+correctness rather than only timing.
+
+| Check | Result |
+|---|---|
+| Skills list non-empty | pass — 27 extracted |
+| All 12 skills known to be in the fixture found | pass |
+| `total_experience_years` populated and plausible | pass — 7.0 |
+| Every `projects[]` entry has a non-empty title | pass — 2 of 2 |
+| No removed field reappeared (9 checked) | pass |
+
+Nothing was lost: roles 4, education 1, both complete.
+
+### 21.4 The embedding text, measured
+
+618 chars / 72 words, against **1142 chars** for a comparable resume before the
+trim — roughly **half**. It is now three noun-heavy lines: a skills list,
+`Roles: <title> at <employer>`, and `Projects: <title> (<tech>)`. The role
+summaries that carried the only job-description-like prose are gone.
+
+This is the cost named in 20.5, now quantified. `COS_LO`/`COS_HI` must be
+re-derived with `scripts/calibrate_similarity.py` before the semantic component
+is trusted.

@@ -14,46 +14,45 @@ PARSED = {
     "name": "Test Candidate",
     "email": "candidate@test.invalid",
     "phone": "+91 90000 00000",
-    "location": "Bengaluru, India",
-    "summary": "Backend engineer focused on distributed systems.",
+    "total_experience_years": 6.0,
     "skills": ["Python", "PostgreSQL", "Docker", "Kafka", "Redis", "Communication"],
+    "projects": [
+        {"title": "Billing reconciliation", "tech": ["Python", "Celery"]},
+        {"title": "Event replay", "tech": ["Kafka", "Go"]},
+    ],
     "experience": [
         {
             "company": "Globex",
-            "title": "Senior Backend Engineer",
-            "start_date": "2021",
-            "end_date": "Present",
-            "is_current": True,
-            "summary": "Built Python services on PostgreSQL.",
+            "role": "Senior Backend Engineer",
+            "duration": "2021 - Present",
         },
         {
             "company": "Initech",
-            "title": "Software Development Engineer II",
-            "start_date": "2019",
-            "end_date": "2021",
-            "is_current": False,
-            "summary": "Maintained an internal billing platform.",
+            "role": "Software Development Engineer II",
+            "duration": "2019 - 2021",
         },
     ],
     "education": [
-        {
-            "institution": "Some University",
-            "degree": "B.E.",
-            "field_of_study": "Computer Science",
-            "graduation_year": 2019,
-        }
+        {"institution": "Some University", "degree": "B.E.", "year": "2019"}
     ],
-    "total_years_experience": 6.0,
 }
 
 
 class TestBuildResumeEmbeddingText:
-    def test_includes_skills_and_experience(self) -> None:
+    def test_includes_skills_roles_and_projects(self) -> None:
         text = build_resume_embedding_text(PARSED)
         assert "Python" in text
         assert "PostgreSQL" in text
         assert "Senior Backend Engineer" in text
         assert "Globex" in text
+
+    def test_includes_project_titles_and_tech(self) -> None:
+        """Projects replace the role summaries the schema trim removed; their
+        tech lists often name tools the skills list omits (here, Celery and Go)."""
+        text = build_resume_embedding_text(PARSED)
+        assert "Event replay" in text
+        assert "Celery" in text
+        assert "Go" in text
 
     def test_excludes_contact_details_and_education(self) -> None:
         """The whole reason this function exists: an address, a phone number and
@@ -63,9 +62,10 @@ class TestBuildResumeEmbeddingText:
         assert "+91 90000 00000" not in text
         assert "candidate@test.invalid" not in text
         assert "Some University" not in text
-        assert "Bengaluru" not in text
 
-    def test_excludes_dates(self) -> None:
+    def test_excludes_durations(self) -> None:
+        """"2021 - Present" is noise under cosine, exactly as the old
+        start/end dates were."""
         text = build_resume_embedding_text(PARSED)
         assert "2021" not in text
         assert "Present" not in text
@@ -83,7 +83,7 @@ class TestBuildResumeEmbeddingText:
         deliberately, and the caller checks for "" to skip embedding entirely."""
         assert build_resume_embedding_text({}) == ""
         assert build_resume_embedding_text(None) == ""
-        assert build_resume_embedding_text({"skills": [], "experience": []}) == ""
+        assert build_resume_embedding_text({"skills": [], "experience": [], "projects": []}) == ""
 
     def test_skills_only_resume_still_produces_text(self) -> None:
         text = build_resume_embedding_text({"skills": ["Rust", "Go"], "experience": []})

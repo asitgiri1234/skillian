@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import runs as run_status
@@ -67,6 +67,14 @@ class MatchOut(BaseModel):
     overall_score: Decimal | None
     semantic_score: Decimal | None
     skill_score: Decimal | None
+    #: Raw earned/possible, before the evidence discount.
+    skill_recall: Decimal | None = None
+    #: Evidence weight in [0, 1]; 1.0 at six parsed requirements.
+    skill_confidence: Decimal | None = None
+    #: Requirements parsed for the job. A skill_score of 1.0 at parsed_count 1
+    #: is a very different claim from 1.0 at parsed_count 9.
+    parsed_count: int | None = None
+    skills_unparsed: bool = False
     matching_skills: list[str] = Field(default_factory=list)
     missing_skills: list[str] = Field(default_factory=list)
     explanation: str | None
@@ -79,6 +87,32 @@ class MatchOut(BaseModel):
     salary_raw: str | None
     apply_url: str | None
     posted_date: Any
+
+
+class MatchPage(BaseModel):
+    """One independently paginated bucket of matches."""
+
+    items: list[MatchOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class MatchesResponse(BaseModel):
+    """Two buckets, because their scores are not the same measurement.
+
+    ``ranked`` — requirements were read; ``overall_score`` is the weighted
+    blend of skill and semantic components.
+
+    ``unparsed`` — no requirements could be extracted, so ``overall_score`` is
+    a bare rescaled cosine. Ordered by that score among themselves and never
+    interleaved with ranked matches. A client should render these under their
+    own heading, not as low-ranked results.
+    """
+
+    resume_id: UUID
+    ranked: MatchPage
+    unparsed: MatchPage
 
 
 class ChunkOut(BaseModel):
@@ -194,55 +228,97 @@ def get_run(run_id: UUID, session: Session = Depends(get_session)) -> RunStatus:
     )
 
 
-@router.get("/matches", response_model=list[MatchOut])
+@router.get("/matches", response_model=MatchesResponse)
 def list_matches(
     resume_id: UUID,
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    unparsed_limit: int = Query(default=20, ge=1, le=200),
+    unparsed_offset: int = Query(default=0, ge=0),
     min_score: float | None = Query(default=None, ge=0.0, le=1.0),
     session: Session = Depends(get_session),
-) -> list[MatchOut]:
-    """A resume's matches, best first, joined to the job fields a list needs.
+) -> MatchesResponse:
+    """A resume's matches, in **two independently paginated buckets**.
 
-    The join is the point: a result list that returned bare job ids would force
-    the client into N follow-up requests to render a single page. Ordering is
-    served by ix_matches_resume_id_overall_score, declared on day 1 for exactly
-    this query.
+    ``ranked`` holds jobs whose requirements were read; ``unparsed`` holds jobs
+    where extraction found nothing and the score is semantic-only.
+
+    They are separated rather than interleaved because their scores are not the
+    same measurement. An unparsed job's ``overall_score`` is a bare rescaled
+    cosine, which lands mid-band; a ranked job's is a weighted blend. Ordering
+    them together put a genuine backend role whose Adzuna teaser yielded no
+    requirements *below* a sales role that matched one skill — the fallback was
+    acting as a penalty, and a number meaning "we could not read this" was
+    competing with numbers meaning "this is a poor fit". See DECISIONS 30.2.
+
+    ``min_score`` applies only to ``ranked``. Filtering the unparsed bucket by a
+    score that is known not to mean the same thing would be a trap.
+
+    The join is the point: returning bare job ids would force the client into N
+    follow-up requests to render a page.
     """
-    stmt = (
-        select(Match, Job)
-        .join(Job, Job.id == Match.job_id)
-        .where(Match.resume_id == resume_id)
-        # NULLS LAST is not needed: overall_score is written on every row the
-        # pipeline creates, and a NULL would sort last under DESC anyway.
-        .order_by(Match.overall_score.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    if min_score is not None:
-        stmt = stmt.where(Match.overall_score >= min_score)
 
-    return [
-        MatchOut(
-            job_id=match.job_id,
-            resume_id=match.resume_id,
-            overall_score=match.overall_score,
-            semantic_score=match.semantic_score,
-            skill_score=match.skill_score,
-            matching_skills=list(match.matching_skills or []),
-            missing_skills=list(match.missing_skills or []),
-            explanation=match.explanation,
-            model_version=match.model_version,
-            title=job.title,
-            company=job.company,
-            location=job.location,
-            is_remote=job.is_remote,
-            salary_raw=job.salary_raw,
-            apply_url=job.apply_url,
-            posted_date=job.posted_date,
+    def rows(unparsed: bool, row_limit: int, row_offset: int):
+        stmt = (
+            select(Match, Job)
+            .join(Job, Job.id == Match.job_id)
+            .where(
+                Match.resume_id == resume_id,
+                Match.skills_unparsed.is_(unparsed),
+            )
+            # NULLS LAST is not needed: overall_score is written on every row
+            # the pipeline creates, and a NULL sorts last under DESC anyway.
+            .order_by(Match.overall_score.desc())
         )
-        for match, job in session.execute(stmt)
-    ]
+        if min_score is not None and not unparsed:
+            stmt = stmt.where(Match.overall_score >= min_score)
+
+        total = session.execute(
+            select(func.count()).select_from(stmt.subquery())
+        ).scalar_one()
+        page = session.execute(stmt.limit(row_limit).offset(row_offset)).all()
+        return total, [_to_match_out(match, job) for match, job in page]
+
+    ranked_total, ranked_items = rows(False, limit, offset)
+    unparsed_total, unparsed_items = rows(True, unparsed_limit, unparsed_offset)
+
+    return MatchesResponse(
+        resume_id=resume_id,
+        ranked=MatchPage(
+            items=ranked_items, total=ranked_total, limit=limit, offset=offset
+        ),
+        unparsed=MatchPage(
+            items=unparsed_items,
+            total=unparsed_total,
+            limit=unparsed_limit,
+            offset=unparsed_offset,
+        ),
+    )
+
+
+def _to_match_out(match: Match, job: Job) -> MatchOut:
+    return MatchOut(
+        job_id=match.job_id,
+        resume_id=match.resume_id,
+        overall_score=match.overall_score,
+        semantic_score=match.semantic_score,
+        skill_score=match.skill_score,
+        skill_recall=match.skill_recall,
+        skill_confidence=match.skill_confidence,
+        parsed_count=match.parsed_count,
+        skills_unparsed=match.skills_unparsed,
+        matching_skills=list(match.matching_skills or []),
+        missing_skills=list(match.missing_skills or []),
+        explanation=match.explanation,
+        model_version=match.model_version,
+        title=job.title,
+        company=job.company,
+        location=job.location,
+        is_remote=job.is_remote,
+        salary_raw=job.salary_raw,
+        apply_url=job.apply_url,
+        posted_date=job.posted_date,
+    )
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetail)

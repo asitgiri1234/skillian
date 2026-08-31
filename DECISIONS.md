@@ -2250,3 +2250,168 @@ Both were invisible until a real corpus existed. Reported, not acted on, as
 instructed. Likely fixes: a confidence floor on `possible` (a job with one
 parsed requirement should not be able to reach 1.0), and revisiting what
 `skills_unparsed` should contribute now that it affects a third of the corpus.
+
+---
+
+# Decisions — Day 3g (two scoring defects found by calibration)
+
+Both were invisible until a real 326-job corpus existed. Both were reported
+first and fixed in a separate pass, which is why the evidence for each is a
+measured ranking rather than an argument.
+
+## 30.1 Weighted recall saturates on thin extraction
+
+`skill_component` is `earned / possible`, so a posting with exactly one parsed
+requirement that the candidate happens to hold scored a perfect **1.0** —
+indistinguishable from a posting matching nine of nine. Measured consequence:
+
+| rank | score | skill | title | matched |
+|---|---|---|---|---|
+| 7 | 0.776 | 1.000 | Account Executive - Italy | **Git** |
+| 11 | 0.733 | 1.000 | Logistics Manager | **SQL** |
+| 12 | 0.732 | 1.000 | Accounting Manager | **SQL** |
+
+That is not a tie between two good matches; one is a match and the other is an
+*absence of evidence*.
+
+**The distribution decided the fix, not intuition.** Over the 326 jobs:
+
+```
+all jobs        mean 2.73  median 1   p75 4   p90 8   p95 10  max 23
+non-zero (211)  mean 4.22  median 3   p75 6   p90 10  max 23
+
+1 skill:  72 jobs  ( 34.1% of non-zero, cumulative)
+2 skills: 32 jobs  ( 49.3%)
+3 skills: 24 jobs  ( 60.7%)
+5 skills: 18 jobs  ( 74.4%)
+6 skills: 11 jobs  ( 79.6%)
+```
+
+**34% of jobs with any parsed requirements have exactly one.** This was not a
+rare edge case; it was a third of the scored corpus.
+
+`skill_score = recall * skill_confidence(parsed_count)` where
+
+    skill_confidence(n) = sqrt(min(1, n / 6))
+
+    n=1 -> 0.41   n=2 -> 0.58   n=3 -> 0.71
+    n=4 -> 0.82   n=5 -> 0.91   n>=6 -> 1.00
+
+**Why N = 6:** the 75th percentile of jobs that parsed anything. Six is "as much
+evidence as the top quartile of postings provides", so the top quartile is
+trusted in full and everything thinner is discounted in proportion.
+
+**Why sqrt rather than linear.** Evidence has diminishing returns — one to three
+requirements is a large gain in confidence, ten to twelve almost none. Linear
+`n/N` also punishes the common 1-2 case very hard (0.17, 0.33) while treating
+5 vs 6 as a large step. The square root is gentler where the data actually
+lives and still keeps a single requirement well away from 1.0.
+
+**Counted, not weight-summed.** Confidence uses `len(job_skills)`, because the
+question it answers is "how much did we manage to read", and a preferred skill
+is as much evidence of readability as a required one.
+
+`skill_recall`, `skill_confidence` and `parsed_count` are now **stored on the
+match row** (migration 0005). A stored `skill_score` with no breakdown is
+unreadable after the fact: recall 1.0 at confidence 0.41 and recall 0.41 at full
+confidence produced the same number and mean completely different things.
+
+### Known asymmetry, not fixed
+
+Confidence discounts thin-evidence *hits* but not thin-evidence *misses*: at
+`recall = 0`, `0 * anything` is still 0. A backend role whose single parsed
+requirement the candidate lacks scores 0.0 on skills with the same finality as
+one that missed nine of nine. `SWE-3 Backend Engineer, ML Systems` sits at the
+bottom of the ranked bucket for exactly this reason. The `confidence` value is
+stored, so a UI can say "based on one requirement" — but the score itself does
+not soften. Worth revisiting; not changed here.
+
+## 30.2 `skills_unparsed` was competing on a different measurement
+
+115 of 326 matches fall back to semantic-only. That number lands mid-band, so a
+genuine backend role whose Adzuna teaser yielded no requirements ranked *below*
+a sales role that matched one skill. The fallback was acting as a penalty, and
+two numbers that do not mean the same thing were being sorted against each
+other: a blend of skill and semantic versus a bare rescaled cosine.
+
+`GET /matches` now returns **two independently paginated buckets**:
+
+```json
+{
+  "resume_id": "...",
+  "ranked":   {"items": [...], "total": 211, "limit": 20, "offset": 0},
+  "unparsed": {"items": [...], "total": 115, "limit": 20, "offset": 0}
+}
+```
+
+`ranked` — requirements were read. `unparsed` — extraction found nothing;
+ordered by semantic score among themselves and never interleaved. A client
+renders these under their own heading ("requirements could not be read"), not
+as low-ranked results.
+
+`min_score` applies to `ranked` only. Filtering the unparsed bucket by a score
+known not to mean the same thing would be a trap.
+
+**This is a breaking API change** — the response was a bare array. Done now
+rather than later precisely because the frontend does not exist yet.
+
+## 30.3 Results after both fixes
+
+Re-scored in **0.697s**; no re-fetch, no re-embed.
+
+```
+overall_score, RANKED ONLY (n=211)
+  min=0.0822  mean=0.2670  max=0.7822
+  p5=0.1190  p25=0.1461  p50=0.2292  p75=0.3601  p95=0.5431
+```
+
+Unparsed bucket: **115**.
+
+**The top 10 is now entirely Python/backend/full-stack roles:**
+
+| score | skill | recall | conf | sem | n | title |
+|---|---|---|---|---|---|---|
+| 0.782 | 0.730 | 0.800 | 0.91 | 0.860 | 5 | Python developer |
+| 0.735 | 0.750 | 0.750 | 1.00 | 0.712 | 8 | Python Developer |
+| 0.670 | 0.826 | 0.826 | 1.00 | 0.436 | 7 | Binance Accelerator - AI |
+| 0.623 | 0.548 | 0.600 | 0.91 | 0.736 | 5 | Full Stack Developer |
+| 0.622 | 0.500 | 0.500 | 1.00 | 0.804 | 10 | Backend Engineer |
+| 0.621 | 0.577 | 1.000 | 0.58 | 0.688 | 2 | Backend Engineer |
+| 0.609 | 0.500 | 0.500 | 1.00 | 0.773 | 6 | Full Stack Engineer (Python/React) |
+| 0.574 | 0.577 | 1.000 | 0.58 | 0.569 | 2 | Sr. Software Engineer (Python) |
+| 0.551 | 0.548 | 0.600 | 0.91 | 0.555 | 5 | Backend Engineer |
+| 0.551 | 0.471 | 0.667 | 0.71 | 0.670 | 3 | Python Developer with ReactJS |
+
+The three offenders moved from ranks 7/11/12 to **28, 44 and 45 of 211**. They
+did not vanish — a sales role that genuinely mentions Git still matches Git —
+but a single requirement now carries a 0.41 weight rather than a 1.0, which is
+the honest treatment.
+
+Rows 6 and 8 are worth reading: recall 1.000 at confidence 0.58 (two parsed
+requirements). They rank where a two-requirement perfect match should — high,
+but below jobs that matched five of five.
+
+The cosine distribution is unchanged by these fixes, as expected: p5 0.5322,
+p95 0.6911, script suggestion 0.53/0.69. **COS_LO/COS_HI and TIER_THRESHOLDS
+remain unset.**
+
+## 30.4 Recommendation on the Adzuna teasers, not acted on
+
+49 of the 52 engineering-titled zero-skill jobs are Adzuna records whose entire
+500-character description is boilerplate — "This job is with X, an inclusive
+employer and a member of myGwork…" — with no technical content at all.
+
+**Recommendation: keep fetching Adzuna, but stop storing records whose
+description is boilerplate-only.** Not "drop Adzuna": it contributed the single
+best match in the corpus (`Python developer`, 0.782) and 4 of the top 10, so
+the source has real value. The problem is a specific record shape, not the feed.
+
+The cheap discriminator is already visible: a description at exactly the
+500-character cap that contains an equal-opportunity phrase and no vocabulary
+hit. Those records cannot be scored on skills by construction, and they
+currently make up most of the 115-row unparsed bucket — where they are at least
+segregated rather than polluting the ranking.
+
+The better fix, if Adzuna is to stay first-class, is to follow `apply_url` and
+fetch the full posting. That is a scraping change with its own failure modes and
+belongs in its own pass.

@@ -291,6 +291,22 @@ class Match(Base):
     overall_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
     semantic_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
     skill_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    # Recall before the evidence discount, and the discount itself. Stored
+    # separately from skill_score so a low score is diagnosable after the fact:
+    # recall 1.0 with confidence 0.41 is "matched the one requirement we could
+    # read", which is a completely different claim from recall 0.2.
+    # See scorer.skill_confidence and DECISIONS 30.1.
+    skill_recall: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    skill_confidence: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 4), nullable=True
+    )
+    #: How many requirements were parsed for the job.
+    parsed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: True when the job had no readable requirements at all. These are ranked
+    #: in their own bucket by GET /matches, not interleaved — see DECISIONS 30.2.
+    skills_unparsed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     matching_skills: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
     missing_skills: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -306,6 +322,13 @@ class Match(Base):
         Index(
             "ix_matches_resume_id_overall_score",
             "resume_id",
+            text("overall_score DESC"),
+        ),
+        # GET /matches runs one query per bucket, each ordered by score.
+        Index(
+            "ix_matches_resume_unparsed_score",
+            "resume_id",
+            "skills_unparsed",
             text("overall_score DESC"),
         ),
     )

@@ -187,6 +187,7 @@ class TestGetRun:
 class TestListMatches:
     @pytest.fixture
     def matches(self, db_session, resume, fake_embedder):
+        """Three ranked matches plus one unparsed, so the split is observable."""
         rows = []
         for index, score in enumerate([0.9, 0.5, 0.2]):
             job = Job(
@@ -207,6 +208,10 @@ class TestListMatches:
                 overall_score=score,
                 semantic_score=score,
                 skill_score=score,
+                skill_recall=1.0,
+                skill_confidence=score,
+                parsed_count=index + 1,
+                skills_unparsed=False,
                 matching_skills=["Python"],
                 missing_skills=["Rust"],
                 explanation=f"Explanation {index}",
@@ -214,46 +219,110 @@ class TestListMatches:
             )
             db_session.add(match)
             rows.append(match)
+
+        # One unparsed match, scored higher than two of the ranked ones. It must
+        # NOT appear among them — that interleaving is the defect being fixed.
+        unparsed_job = Job(
+            source="fake",
+            source_job_id=f"u-{uuid.uuid4().hex[:12]}",
+            dedup_hash=uuid.uuid4().hex,
+            title="Unreadable posting",
+            company="Boilerplate Inc",
+            location="Bengaluru",
+        )
+        db_session.add(unparsed_job)
+        db_session.flush()
+        db_session.add(
+            Match(
+                resume_id=resume.id,
+                job_id=unparsed_job.id,
+                overall_score=0.7,
+                semantic_score=0.7,
+                skill_score=0.0,
+                skill_recall=0.0,
+                skill_confidence=0.0,
+                parsed_count=0,
+                skills_unparsed=True,
+                matching_skills=[],
+                missing_skills=[],
+                model_version="test",
+            )
+        )
         db_session.flush()
         return rows
 
+    def test_returns_two_buckets(self, client, resume, matches) -> None:
+        body = client.get("/matches", params={"resume_id": str(resume.id)}).json()
+        assert body["ranked"]["total"] == 3
+        assert body["unparsed"]["total"] == 1
+
+    def test_unparsed_is_not_interleaved_with_ranked(self, client, resume, matches) -> None:
+        """The defect: an unparsed job scoring 0.7 must not sit between the
+        ranked 0.9 and 0.5. Its score is a bare cosine, not a blend."""
+        body = client.get("/matches", params={"resume_id": str(resume.id)}).json()
+        ranked_titles = [row["title"] for row in body["ranked"]["items"]]
+        assert "Unreadable posting" not in ranked_titles
+        assert body["unparsed"]["items"][0]["title"] == "Unreadable posting"
+        assert all(row["skills_unparsed"] is False for row in body["ranked"]["items"])
+        assert all(row["skills_unparsed"] is True for row in body["unparsed"]["items"])
+
     def test_sorted_by_score_descending(self, client, resume, matches) -> None:
         body = client.get("/matches", params={"resume_id": str(resume.id)}).json()
-        scores = [float(row["overall_score"]) for row in body]
+        scores = [float(row["overall_score"]) for row in body["ranked"]["items"]]
         assert scores == sorted(scores, reverse=True)
 
     def test_includes_joined_job_fields(self, client, resume, matches) -> None:
-        """A result list returning bare job ids would force N follow-up requests
-        to render a single page."""
-        row = client.get("/matches", params={"resume_id": str(resume.id)}).json()[0]
-        assert row["title"]
-        assert row["company"]
-        assert row["apply_url"]
+        """A result list returning bare job ids would force N follow-up
+        requests to render a single page."""
+        row = client.get(
+            "/matches", params={"resume_id": str(resume.id)}
+        ).json()["ranked"]["items"][0]
+        assert row["title"] and row["company"] and row["apply_url"]
         assert row["explanation"]
         assert row["matching_skills"] == ["Python"]
 
-    def test_min_score_filters(self, client, resume, matches) -> None:
+    def test_exposes_the_confidence_breakdown(self, client, resume, matches) -> None:
+        """recall 1.0 at confidence 0.2 and recall 0.2 at confidence 1.0 are
+        different claims; the client needs both to say which."""
+        row = client.get(
+            "/matches", params={"resume_id": str(resume.id)}
+        ).json()["ranked"]["items"][0]
+        assert float(row["skill_recall"]) == pytest.approx(1.0)
+        assert row["skill_confidence"] is not None
+        assert row["parsed_count"] is not None
+
+    def test_min_score_filters_ranked_only(self, client, resume, matches) -> None:
         body = client.get(
             "/matches", params={"resume_id": str(resume.id), "min_score": 0.4}
         ).json()
-        assert len(body) == 2
+        assert body["ranked"]["total"] == 2
+        # The unparsed bucket is untouched: filtering it by a score known not to
+        # mean the same thing would be a trap.
+        assert body["unparsed"]["total"] == 1
 
-    def test_limit_and_offset(self, client, resume, matches) -> None:
+    def test_buckets_paginate_independently(self, client, resume, matches) -> None:
         first = client.get(
             "/matches", params={"resume_id": str(resume.id), "limit": 1}
         ).json()
         second = client.get(
-            "/matches", params={"resume_id": str(resume.id), "limit": 1, "offset": 1}
+            "/matches",
+            params={"resume_id": str(resume.id), "limit": 1, "offset": 1},
         ).json()
-        assert len(first) == len(second) == 1
-        assert first[0]["job_id"] != second[0]["job_id"]
+        assert len(first["ranked"]["items"]) == 1
+        assert len(second["ranked"]["items"]) == 1
+        assert first["ranked"]["items"][0]["job_id"] != second["ranked"]["items"][0]["job_id"]
+        # Totals report the whole bucket, not the page.
+        assert first["ranked"]["total"] == second["ranked"]["total"] == 3
+        # Paging ranked does not page unparsed.
+        assert len(first["unparsed"]["items"]) == 1
 
-    def test_unknown_resume_returns_an_empty_list(self, client) -> None:
-        """Not a 404: "this resume has no matches yet" is the normal state
-        while a search is still running."""
+    def test_unknown_resume_returns_empty_buckets(self, client) -> None:
+        """Not a 404: "no matches yet" is the normal state while a search runs."""
         response = client.get("/matches", params={"resume_id": str(uuid.uuid4())})
         assert response.status_code == 200
-        assert response.json() == []
+        body = response.json()
+        assert body["ranked"]["items"] == [] and body["ranked"]["total"] == 0
+        assert body["unparsed"]["items"] == [] and body["unparsed"]["total"] == 0
 
 
 class TestGetJob:

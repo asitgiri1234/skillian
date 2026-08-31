@@ -57,6 +57,17 @@ COS_LO, COS_HI = 0.45, 0.85
 #: How many chunks contribute to the semantic score. See semantic_component.
 TOP_K_CHUNKS = 3
 
+#: Parsed requirements at which the recall ratio is trusted in full.
+#:
+#: Chosen from the measured distribution over 326 real postings rather than
+#: guessed: of the 211 jobs with any parsed requirements, the median is 3 and
+#: the 75th percentile is 6. Six is therefore "as much evidence as the top
+#: quartile of postings provides", and jobs at or above it get no discount.
+#:
+#: The number that forced this: **34% of jobs with any requirements have
+#: exactly one.** See skill_confidence and DECISIONS 30.1.
+SKILL_CONFIDENCE_FULL = 6
+
 #: Stamped onto matches.model_version so a scoring change can invalidate old
 #: rows selectively instead of truncating the table. Bump it when a weight,
 #: a bound, or the formula changes.
@@ -127,9 +138,22 @@ class JobPosting:
 
 
 class SkillMatch(NamedTuple):
-    """``(score, matched, missing)`` — a tuple, but a named one."""
+    """The skill component, with its parts kept separate for diagnosis.
 
+    ``score`` is what feeds the weighted sum; ``recall`` and ``confidence`` are
+    retained because a low score means two very different things depending on
+    which of them is low, and a stored score with no breakdown is unreadable
+    after the fact.
+    """
+
+    #: recall * confidence — the value used in the overall score.
     score: float
+    #: earned / possible over the job's parsed requirements.
+    recall: float
+    #: How much evidence the ratio rests on. See skill_confidence().
+    confidence: float
+    #: How many requirements were parsed for this job.
+    parsed_count: int
     matched: list[str]
     missing: list[str]
 
@@ -140,9 +164,16 @@ class ScoreResult:
 
     overall_score: float
     semantic_score: float
-    #: 0.0 when requirements could not be parsed; read ``skills_unparsed`` to
-    #: tell that apart from "matched none of the requirements".
+    #: recall * confidence. 0.0 when requirements could not be parsed; read
+    #: ``skills_unparsed`` to tell that apart from "matched none of them".
     skill_score: float
+    #: Raw earned/possible, before the confidence discount.
+    skill_recall: float = 0.0
+    #: Evidence weight applied to the recall ratio, in [0, 1].
+    skill_confidence: float = 0.0
+    #: Requirements parsed for this job. Stored so a low score is diagnosable
+    #: as thin-evidence rather than genuine mismatch.
+    parsed_count: int = 0
     matching_skills: list[str] = field(default_factory=list)
     missing_skills: list[str] = field(default_factory=list)
     #: True when the job had no ``job_skills`` rows, so the skill component was
@@ -206,6 +237,39 @@ def _weight_for(requirement: str | None) -> float:
     return SKILL_WEIGHTS[level]
 
 
+def skill_confidence(parsed_count: int) -> float:
+    """How much to trust a recall ratio built on ``parsed_count`` requirements.
+
+    ``sqrt(min(1, n / SKILL_CONFIDENCE_FULL))`` — in [0, 1], reaching 1.0 at
+    six parsed requirements.
+
+    **Why a discount at all.** Recall is ``earned / possible``, so a posting
+    with exactly one parsed requirement that the candidate happens to hold
+    scores a perfect 1.0 — identical to a posting matching nine of nine. That
+    is not a tie: one is a match, the other is an absence of evidence. Measured
+    consequence before this existed: "Account Executive - Italy", whose sole
+    parsed requirement was Git, ranked 7th of 326 and above most backend roles.
+
+    **Why sqrt rather than linear.** Evidence has diminishing returns. Going
+    from one requirement to three is a large gain in confidence; from ten to
+    twelve is almost none. Linear ``n/N`` also punishes the common 1-2
+    requirement case harshly (0.17, 0.33) while treating 5 vs 6 as a big step.
+    The square root is gentler where the data actually lives and still keeps a
+    single requirement well away from 1.0:
+
+        n=1 -> 0.41    n=2 -> 0.58    n=3 -> 0.71
+        n=4 -> 0.82    n=5 -> 0.91    n>=6 -> 1.00
+
+    Zero requirements returns 0.0, but that path is unreachable through
+    :func:`skill_component`, which returns None instead — "unparsed" is a
+    different state from "no confidence", and conflating them is the mistake
+    DECISIONS 16.5 exists to prevent.
+    """
+    if parsed_count <= 0:
+        return 0.0
+    return math.sqrt(min(1.0, parsed_count / SKILL_CONFIDENCE_FULL))
+
+
 def skill_component(
     resume_skill_ids: frozenset[UUID] | set[UUID],
     job_skills: Sequence[JobSkillRef],
@@ -247,7 +311,19 @@ def skill_component(
     if possible <= 0.0:
         return None
 
-    return SkillMatch(score=earned / possible, matched=matched, missing=missing)
+    recall = earned / possible
+    # Count of requirements, not their summed weight: the question confidence
+    # answers is "how much did we manage to read", and a preferred skill is as
+    # much evidence of readability as a required one.
+    confidence = skill_confidence(len(job_skills))
+    return SkillMatch(
+        score=recall * confidence,
+        recall=recall,
+        confidence=confidence,
+        parsed_count=len(job_skills),
+        matched=matched,
+        missing=missing,
+    )
 
 
 def semantic_component(
@@ -358,6 +434,9 @@ def score(resume: ResumeProfile, job: JobPosting) -> ScoreResult:
         overall_score=overall,
         semantic_score=semantic,
         skill_score=skills.score,
+        skill_recall=skills.recall,
+        skill_confidence=skills.confidence,
+        parsed_count=skills.parsed_count,
         matching_skills=skills.matched,
         missing_skills=skills.missing,
         skills_unparsed=False,

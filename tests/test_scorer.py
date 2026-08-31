@@ -21,6 +21,7 @@ from app.matching.scorer import (
     score,
     semantic_component,
     skill_component,
+    skill_confidence,
 )
 
 
@@ -90,6 +91,7 @@ class TestSkillComponent:
         """Contrast with the above: requirements parsed, none held."""
         result = skill_component(set(), [_skill("Rust"), _skill("Go")])
         assert result is not None
+        assert result.recall == 0.0
         assert result.score == 0.0
         assert result.matched == []
         assert result.missing == ["Rust", "Go"]
@@ -98,7 +100,7 @@ class TestSkillComponent:
         python, sql = _skill("Python"), _skill("SQL")
         result = skill_component({python.skill_id, sql.skill_id}, [python, sql])
         assert result is not None
-        assert result.score == pytest.approx(1.0)
+        assert result.recall == pytest.approx(1.0)
         assert result.matched == ["Python", "SQL"]
         assert result.missing == []
 
@@ -113,9 +115,9 @@ class TestSkillComponent:
         has_preferred = skill_component({preferred.skill_id}, skills)
 
         assert has_required is not None and has_preferred is not None
-        assert has_required.score == pytest.approx(1.0 / 1.4)
-        assert has_preferred.score == pytest.approx(0.4 / 1.4)
-        assert has_required.score > has_preferred.score
+        assert has_required.recall == pytest.approx(1.0 / 1.4)
+        assert has_preferred.recall == pytest.approx(0.4 / 1.4)
+        assert has_required.recall > has_preferred.recall
 
     def test_is_recall_not_jaccard(self) -> None:
         """Extra skills the job never asked for must not dilute the score.
@@ -130,12 +132,12 @@ class TestSkillComponent:
             [python, sql],
         )
         assert exact is not None and generalist is not None
-        assert generalist.score == exact.score == pytest.approx(1.0)
+        assert generalist.recall == exact.recall == pytest.approx(1.0)
 
     def test_null_requirement_counts_as_required(self) -> None:
         skill = _skill("Python", None)
         result = skill_component({skill.skill_id}, [skill])
-        assert result is not None and result.score == pytest.approx(1.0)
+        assert result is not None and result.recall == pytest.approx(1.0)
 
     def test_unknown_requirement_label_does_not_raise(self) -> None:
         """job_skills.requirement is free text; a surprise value must not abort
@@ -143,7 +145,7 @@ class TestSkillComponent:
         odd = _skill("Python", "would-be-lovely")
         result = skill_component({odd.skill_id}, [odd])
         assert result is not None
-        assert result.score == pytest.approx(1.0)
+        assert result.recall == pytest.approx(1.0)
 
     def test_requirement_aliases_are_folded(self) -> None:
         nice = _skill("Kubernetes", "nice_to_have")
@@ -151,7 +153,7 @@ class TestSkillComponent:
         result = skill_component({nice.skill_id}, [nice, must])
         assert result is not None
         # 0.4 earned out of 0.4 + 1.0 possible.
-        assert result.score == pytest.approx(0.4 / 1.4)
+        assert result.recall == pytest.approx(0.4 / 1.4)
 
     def test_accepts_a_frozenset_or_a_set(self) -> None:
         skill = _skill("Python")
@@ -282,9 +284,17 @@ class TestScore:
         )
         result = score(resume, job)
 
-        assert result.skill_score == pytest.approx(1.0)
+        # One parsed requirement -> confidence sqrt(1/6) ~= 0.408, so a perfect
+        # recall does NOT produce a perfect skill score. This is the fix for the
+        # "Account Executive matched Git and ranked 7th" defect.
+        assert result.skill_recall == pytest.approx(1.0)
+        assert result.skill_confidence == pytest.approx(skill_confidence(1))
+        assert result.skill_score == pytest.approx(1.0 * skill_confidence(1))
+        assert result.parsed_count == 1
         assert result.semantic_score == pytest.approx(1.0)
-        assert result.overall_score == pytest.approx(W_SKILL * 1.0 + W_SEMANTIC * 1.0)
+        assert result.overall_score == pytest.approx(
+            W_SKILL * skill_confidence(1) + W_SEMANTIC * 1.0
+        )
         assert result.skills_unparsed is False
 
     def test_falls_back_to_semantic_when_skills_unparsed(self) -> None:
@@ -331,7 +341,7 @@ class TestScore:
         result = score(resume, job)
         assert result.experience_multiplier == pytest.approx(0.70)
         assert result.overall_score == pytest.approx(
-            (W_SKILL * 1.0 + W_SEMANTIC * 1.0) * 0.70
+            (W_SKILL * skill_confidence(1) + W_SEMANTIC * 1.0) * 0.70
         )
 
     def test_result_stays_within_zero_and_one(self) -> None:
@@ -358,7 +368,7 @@ class TestScore:
         )
         result = score(resume, JobPosting(job_id=uuid.uuid4(), skills=(python,)))
         assert result.semantic_score == 0.0
-        assert result.overall_score == pytest.approx(W_SKILL * 1.0)
+        assert result.overall_score == pytest.approx(W_SKILL * skill_confidence(1))
 
     def test_is_pure(self) -> None:
         """Same inputs, same output, twice."""
@@ -382,3 +392,64 @@ def test_weights_sum_to_one() -> None:
 
 def test_calibration_bounds_are_ordered() -> None:
     assert scorer.COS_LO < scorer.COS_HI
+
+
+# --- the evidence discount --------------------------------------------------
+
+
+class TestSkillConfidence:
+    """The fix for the defect calibration exposed: weighted recall saturates on
+    thin extraction, so a job with one parsed requirement the candidate holds
+    scored a perfect 1.0 and out-ranked a backend role matching nine of nine."""
+
+    def test_one_requirement_cannot_reach_full_confidence(self) -> None:
+        assert skill_confidence(1) < 0.5
+
+    def test_reaches_one_at_the_full_evidence_threshold(self) -> None:
+        assert skill_confidence(scorer.SKILL_CONFIDENCE_FULL) == pytest.approx(1.0)
+
+    def test_saturates_rather_than_exceeding_one(self) -> None:
+        assert skill_confidence(50) == 1.0
+
+    def test_is_monotonic(self) -> None:
+        values = [skill_confidence(n) for n in range(1, 12)]
+        assert values == sorted(values)
+
+    def test_has_diminishing_returns(self) -> None:
+        """sqrt, not linear: 1->2 requirements is a bigger gain in confidence
+        than 4->5, because evidence accumulates with diminishing returns."""
+        assert (skill_confidence(2) - skill_confidence(1)) > (
+            skill_confidence(5) - skill_confidence(4)
+        )
+
+    def test_zero_is_zero(self) -> None:
+        """Unreachable via skill_component, which returns None instead — an
+        unparsed job is a different state from a zero-confidence one."""
+        assert skill_confidence(0) == 0.0
+
+    def test_a_thin_perfect_match_scores_below_a_thorough_one(self) -> None:
+        """The regression this exists to prevent, end to end."""
+        one = _skill("Git")
+        many = [_skill(f"S{i}") for i in range(9)]
+        resume_ids = frozenset({one.skill_id, *(s.skill_id for s in many)})
+
+        thin = score(
+            ResumeProfile(resume_id=uuid.uuid4(), skill_ids=resume_ids),
+            JobPosting(job_id=uuid.uuid4(), skills=(one,)),
+        )
+        thorough = score(
+            ResumeProfile(resume_id=uuid.uuid4(), skill_ids=resume_ids),
+            JobPosting(job_id=uuid.uuid4(), skills=tuple(many)),
+        )
+        assert thin.skill_recall == thorough.skill_recall == pytest.approx(1.0)
+        assert thin.skill_score < thorough.skill_score
+        assert thin.overall_score < thorough.overall_score
+
+    def test_unparsed_reports_zero_confidence_and_count(self) -> None:
+        result = score(
+            ResumeProfile(resume_id=uuid.uuid4(), embedding=[1.0, 0.0]),
+            JobPosting(job_id=uuid.uuid4(), skills=(), chunk_embeddings=([1.0, 0.0],)),
+        )
+        assert result.skills_unparsed is True
+        assert result.skill_confidence == 0.0
+        assert result.parsed_count == 0

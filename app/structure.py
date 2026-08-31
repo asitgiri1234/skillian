@@ -20,7 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from app.providers import LLMProvider, get_llm_provider
+from app.providers import LLMProvider, get_parse_provider
 
 logger = logging.getLogger(__name__)
 
@@ -417,7 +417,10 @@ def extract_resume(
 
     from app.config import get_settings
 
-    provider = llm or get_llm_provider()
+    # get_parse_provider, not get_llm_provider: resume parsing is the one
+    # call per upload that a user actually waits on, so it runs on the
+    # hosted provider with a local fallback. See DECISIONS 22.4.
+    provider = llm or get_parse_provider()
     attempts = max_attempts or get_settings().extraction_max_attempts
 
     text = resume_text.strip()

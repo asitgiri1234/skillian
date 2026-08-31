@@ -66,6 +66,31 @@ class Settings(BaseSettings):
     # 300 after a verification run timed out mid-extraction.
     ollama_timeout_seconds: float = 300.0
 
+    # --- Groq -------------------------------------------------------------
+    # Hosted inference. Unlike Ollama, using it sends resume text off this
+    # machine — a deliberate exception to the local-only premise, taken because
+    # extraction drops from ~101s to ~3s. Optional: with no key, PARSE_PROVIDER
+    # falls back to Ollama on every call.
+    groq_api_key: str | None = None
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Chosen 2026-08-31 by listing /openai/v1/models and measuring all three
+    # viable candidates. NOT llama-3.3-70b-versatile, which this account's API
+    # does not offer — the model list moves, so verify before changing this.
+    # qwen3.8 was fastest (2.5s) and, crucially, emits no reasoning tokens: the
+    # gpt-oss models spent 894-996 completion tokens on hidden reasoning against
+    # an 8000 tokens/minute limit. See DECISIONS 22.3.
+    groq_model: str = "qwen/qwen3.8-27b"
+    # Hosted and fast; a long ceiling here would only delay the Ollama fallback.
+    groq_timeout_seconds: float = 60.0
+
+    # --- Parsing ----------------------------------------------------------
+    # Which provider parses resumes. Distinct from LLM_PROVIDER (which still
+    # drives job-skill extraction and match explanations) because those run
+    # per-job inside a search and would exhaust Groq's free-tier token budget;
+    # resume parsing is one call per upload. See DECISIONS 22.4.
+    # Falls back to Ollama automatically on any Groq failure.
+    parse_provider: str = "groq"
+
     # --- Extraction -------------------------------------------------------
     # Attempts for the validate-and-retry loop in app/structure.py. Constrained
     # decoding fixes shape, not accuracy, so retries are about semantic failures.

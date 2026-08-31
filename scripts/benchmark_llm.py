@@ -51,7 +51,6 @@ from app.structure import (  # noqa: E402
     EducationRef,
     ExperienceRef,
     ParsedResume,
-    build_resume_embedding_text,
 )
 
 # --- fixtures ---------------------------------------------------------------
@@ -355,11 +354,11 @@ REMOVED_FIELDS = (
 )
 
 
-def _capture_tokens(llm: Any) -> dict[str, Any]:
-    """Wrap the provider's client to record Ollama's own token counters.
+def _capture_ollama(llm: Any) -> dict[str, Any]:
+    """Wrap the Ollama client to record its own token counters.
 
     In-memory only, on this one instance. The provider ABC discards these
-    deliberately (they are an Ollama detail), but the whole question here is
+    deliberately (they are a backend detail), but the whole question here is
     output volume, so the measurement needs them.
     """
     stats: dict[str, Any] = {}
@@ -375,138 +374,237 @@ def _capture_tokens(llm: Any) -> dict[str, Any]:
     return stats
 
 
-def verify_trim() -> int:
-    """Measure the trimmed schema and assert it did not lose anything."""
-    settings = get_settings()
-    print("=" * 78)
-    print("VERIFY TRIM: trimmed ParsedResume vs the pre-trim baseline")
-    print("=" * 78)
-    print(f"  model           {settings.ollama_llm_model}")
-    print(f"  resume fixture  {len(RESUME_TEXT.split())} words (same as the diagnostic)")
-    chars, props = _schema_size(ParsedResume)
-    print(f"  schema          {chars} chars, {props} top-level fields")
-    print()
+def _capture_groq(llm: Any) -> dict[str, Any]:
+    """Same, for Groq: usage comes back in the body, not on the client.
 
-    step_1_daemon(settings)
-    print()
+    Also records ``reasoning``. The gpt-oss models spend hundreds of completion
+    tokens on hidden reasoning, which makes their ``completion_tokens``
+    incomparable to Ollama's ``eval_count`` unless the split is visible — the
+    kind of thing that silently invalidates a side-by-side table.
+    """
+    stats: dict[str, Any] = {}
+    original = llm._post
 
-    llm = get_llm_provider()
-    stats = _capture_tokens(llm)
-
-    print("Warming the model (throwaway call)...")
-    warm_seconds, _ = timed(lambda: llm.complete_text("Reply with exactly one word: hello"))
-    print(f"  warm-up {warm_seconds:.2f}s")
-    print()
-
-    print("1. Trimmed ParsedResume extraction")
-    elapsed, raw = timed(
-        lambda: llm.complete(_prompt(RESUME_TEXT), ParsedResume, system=_SYSTEM)
-    )
-    out_tokens = stats.get("out")
-    in_tokens = stats.get("in")
-    print(f"   wall clock      {elapsed:.2f}s")
-    print(f"   input tokens    {in_tokens}")
-    print(f"   output tokens   {out_tokens}")
-    print()
-
-    print("2. Throughput")
-    if out_tokens:
-        rate = out_tokens / elapsed
-        baseline_rate = BASELINE_TOKENS / BASELINE_SECONDS
-        print(f"   trimmed         {rate:.2f} tok/s")
-        print(f"   baseline        {baseline_rate:.2f} tok/s")
-        # If tok/s moved, the machine was in a different state and the speedup
-        # cannot be attributed to the token reduction. Saying so is the point of
-        # measuring it.
-        if abs(rate - baseline_rate) < 1.0:
-            print("   -> UNCHANGED: the win came from emitting fewer tokens")
-        else:
-            print("   -> CHANGED: machine state differs, speedup not attributable")
-    print()
-
-    print("3. Against the baseline")
-    print(f"   baseline        {BASELINE_TOKENS} tokens / {BASELINE_SECONDS:.1f}s")
-    if out_tokens:
-        print(
-            f"   trimmed         {out_tokens} tokens / {elapsed:.1f}s"
-            f"   ({out_tokens / BASELINE_TOKENS:.0%} of tokens, "
-            f"{elapsed / BASELINE_SECONDS:.0%} of time)"
+    def post(body: dict[str, Any]) -> dict[str, Any]:
+        payload = original(body)
+        usage = payload.get("usage") or {}
+        stats["in"] = usage.get("prompt_tokens")
+        stats["out"] = usage.get("completion_tokens")
+        stats["reasoning"] = (usage.get("completion_tokens_details") or {}).get(
+            "reasoning_tokens", 0
         )
-        print(f"   speedup         {BASELINE_SECONDS / elapsed:.2f}x")
-    print()
+        stats["rate_limit"] = dict(llm.last_rate_limit)
+        return payload
 
-    # --- correctness -------------------------------------------------------
-    print("4. Correctness (a fast extraction that loses skills is worse than a slow one)")
+    llm._post = post
+    return stats
+
+
+def _build_provider(name: str) -> tuple[Any, dict[str, Any], str]:
+    """Return ``(provider, live stats dict, model name)`` for ``name``."""
+    from app.providers import GroqLLMProvider, get_llm_provider
+
+    settings = get_settings()
+    if name == "groq":
+        provider = GroqLLMProvider(settings=settings)
+        return provider, _capture_groq(provider), provider.model
+    provider = get_llm_provider(settings)
+    return provider, _capture_ollama(provider), provider.model
+
+
+def _check_quality(raw: dict[str, Any]) -> tuple[list[str], Any]:
+    """Run the correctness assertions. Returns ``(failures, parsed_or_None)``."""
     failures: list[str] = []
-
     try:
         parsed = ParsedResume.model_validate(raw)
     except Exception as exc:  # noqa: BLE001 - report, do not traceback
-        print(f"   [FAIL] output did not validate: {exc}")
-        return 1
+        return [f"output did not validate: {exc}"], None
 
-    if parsed.skills:
-        print(f"   [PASS] skills non-empty ({len(parsed.skills)}): "
-              f"{', '.join(parsed.skills[:12])}")
-    else:
+    if not parsed.skills:
         failures.append("skills list is empty")
-        print("   [FAIL] skills list is empty")
-
     found = {s.casefold() for s in parsed.skills}
     missed = [s for s in EXPECTED_SKILLS if not any(s in f for f in found)]
     if missed:
-        failures.append(f"skills present in the resume but not extracted: {missed}")
-        print(f"   [FAIL] missed {len(missed)}/{len(EXPECTED_SKILLS)} expected: "
-              f"{', '.join(missed)}")
-    else:
-        print(f"   [PASS] all {len(EXPECTED_SKILLS)} expected skills found")
+        failures.append(f"skills in the resume but not extracted: {missed}")
 
     years = parsed.total_experience_years
     if years is None:
         failures.append("total_experience_years is null")
-        print("   [FAIL] total_experience_years is null")
     elif not (3 <= years <= 12):
         failures.append(f"total_experience_years implausible: {years}")
-        print(f"   [FAIL] total_experience_years = {years}, expected ~7")
-    else:
-        print(f"   [PASS] total_experience_years = {years} (plausible)")
 
-    if not parsed.projects:
-        # Not a hard failure: the fixture has a PROJECTS section, but a model
-        # may reasonably fold them into experience.
-        print("   [WARN] projects list is empty (fixture has a PROJECTS section)")
-    elif all(p.title for p in parsed.projects):
-        print(f"   [PASS] all {len(parsed.projects)} project(s) have a title: "
-              f"{', '.join(p.title for p in parsed.projects)}")
-    else:
+    if parsed.projects and not all(p.title for p in parsed.projects):
         failures.append("a project has an empty title")
-        print("   [FAIL] at least one project has an empty title")
 
     leaked = sorted(_find_keys(raw, REMOVED_FIELDS))
     if leaked:
-        failures.append(f"removed fields present in output: {leaked}")
-        print(f"   [FAIL] removed field(s) reappeared: {', '.join(leaked)}")
-    else:
-        print(f"   [PASS] none of the {len(REMOVED_FIELDS)} removed fields reappeared")
+        failures.append(f"removed fields reappeared: {leaked}")
+    return failures, parsed
 
-    print(f"   [INFO] roles {len(parsed.experience)}, education {len(parsed.education)}")
+
+def _fmt(value: Any, spec: str = "") -> str:
+    """Format that tolerates None, so a failed provider still prints a row."""
+    if value is None:
+        return "-"
+    return format(value, spec) if spec else str(value)
+
+
+def verify_trim(provider_names: list[str]) -> int:
+    """Measure the trimmed schema on each provider and assert quality holds."""
+    print("=" * 78)
+    print("VERIFY TRIM: trimmed ParsedResume, one row per provider")
+    print("=" * 78)
+    print(f"  resume fixture  {len(RESUME_TEXT.split())} words (same as the diagnostic)")
+    chars, props = _schema_size(ParsedResume)
+    print(f"  schema          {chars} chars, {props} top-level fields")
+    print(f"  baseline        {BASELINE_TOKENS} out tok / {BASELINE_SECONDS:.1f}s / "
+          f"{BASELINE_TOKENS / BASELINE_SECONDS:.2f} tok/s  (ollama, post-trim)")
     print()
 
-    # --- embedding text ----------------------------------------------------
-    print("5. Embedding text (the known cost of the trim)")
-    text = build_resume_embedding_text(parsed)
-    print(f"   {len(text)} chars, {len(text.split())} words")
-    print("   " + "\n   ".join(text.splitlines()[:6]))
+    rows: list[dict[str, Any]] = []
+    exit_code = 0
+
+    for name in provider_names:
+        print("-" * 78)
+        print(f"PROVIDER: {name}")
+        print("-" * 78)
+        try:
+            provider, stats, model = _build_provider(name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"   [FAIL] could not build provider: {type(exc).__name__}: {exc}")
+            exit_code = 1
+            continue
+
+        print(f"   model  {model}")
+        try:
+            # Warm it, so first-call model load is not inside the measurement.
+            provider.complete_text("Reply with exactly one word: hello")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   [FAIL] warm-up call failed: {type(exc).__name__}: {exc}")
+            exit_code = 1
+            continue
+
+        stats.clear()
+        try:
+            elapsed, raw = timed(
+                lambda: provider.complete(
+                    _prompt(RESUME_TEXT), ParsedResume, system=_SYSTEM
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"   [FAIL] extraction failed: {type(exc).__name__}: {exc}")
+            exit_code = 1
+            continue
+
+        out = stats.get("out")
+        reasoning = stats.get("reasoning") or 0
+        emitted = (out - reasoning) if out is not None else None
+        rate = (out / elapsed) if out else None
+
+        print(f"   wall clock       {elapsed:8.2f}s")
+        print(f"   input tokens     {_fmt(stats.get('in'))}")
+        line = f"   output tokens    {_fmt(out)}"
+        if reasoning:
+            line += f"   ({reasoning} hidden reasoning -> {emitted} emitted)"
+        print(line)
+        if rate:
+            print(f"   throughput       {rate:8.2f} tok/s")
+        print(f"   vs baseline      {BASELINE_SECONDS / elapsed:8.2f}x faster")
+
+        failures, parsed = _check_quality(raw)
+        if parsed is not None:
+            print(f"   skills {len(parsed.skills)}, roles {len(parsed.experience)}, "
+                  f"projects {len(parsed.projects)}, education {len(parsed.education)}, "
+                  f"years {parsed.total_experience_years}")
+        if failures:
+            exit_code = 1
+            for failure in failures:
+                print(f"   [FAIL] {failure}")
+        else:
+            print("   [PASS] all correctness checks")
+
+        limits = stats.get("rate_limit") or {}
+        if limits:
+            print("   rate-limit headers:")
+            for key in sorted(limits):
+                print(f"     {key}: {limits[key]}")
+
+        rows.append(
+            {
+                "provider": name,
+                "model": model,
+                "seconds": elapsed,
+                "out": out,
+                "reasoning": reasoning,
+                "emitted": emitted,
+                "rate": rate,
+                "skills": len(parsed.skills) if parsed else 0,
+                "ok": not failures,
+                "parsed": parsed,
+            }
+        )
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
+        print()
+
+    # --- side by side ------------------------------------------------------
+    print("=" * 78)
+    print("SIDE BY SIDE")
+    print("=" * 78)
+    header = (
+        f"{'PROVIDER':<9} {'MODEL':<24} {'OUT':>7} {'EMIT':>7} "
+        f"{'SECONDS':>8} {'TOK/S':>7} {'SKILLS':>7}  QUALITY"
+    )
+    print(header)
+    print("-" * len(header))
+    print(
+        f"{'baseline':<9} {'qwen2.5:7b (ollama)':<24} {BASELINE_TOKENS:>7} "
+        f"{BASELINE_TOKENS:>7} {BASELINE_SECONDS:>8.1f} "
+        f"{BASELINE_TOKENS / BASELINE_SECONDS:>7.2f} {'-':>7}  (recorded)"
+    )
+    for row in rows:
+        print(
+            f"{row['provider']:<9} {row['model'][:24]:<24} "
+            f"{_fmt(row['out']):>7} {_fmt(row['emitted']):>7} "
+            f"{row['seconds']:>8.2f} {_fmt(row['rate'], '.2f'):>7} "
+            f"{row['skills']:>7}  {'PASS' if row['ok'] else 'FAIL'}"
+        )
     print()
+
+    # --- is the token count flat across providers? -------------------------
+    if len(rows) == 2 and all(r["emitted"] for r in rows):
+        first, second = rows
+        biggest = max(first["emitted"], second["emitted"])
+        drift = abs(first["emitted"] - second["emitted"]) / biggest
+        print(f"Emitted-token drift between providers: {drift:.0%}")
+        if drift > 0.25:
+            print("  -> NOT flat. Same schema, same temperature, so this is a")
+            print("     difference in prompt or schema handling. Investigate.")
+        else:
+            print("  -> roughly flat, as expected for one schema at temperature=0.")
+        print()
+
+    # --- did they agree about the resume? ----------------------------------
+    parsed_rows = [r for r in rows if r["parsed"] is not None]
+    if len(parsed_rows) == 2:
+        first, second = (r["parsed"] for r in parsed_rows)
+        only_first = sorted({s.casefold() for s in first.skills}
+                            - {s.casefold() for s in second.skills})
+        only_second = sorted({s.casefold() for s in second.skills}
+                             - {s.casefold() for s in first.skills})
+        print("Skill-set diff (quality is what matters, not speed):")
+        print(f"  only {parsed_rows[0]['provider']}: {only_first or 'none'}")
+        print(f"  only {parsed_rows[1]['provider']}: {only_second or 'none'}")
+        print(f"  years: {parsed_rows[0]['provider']}="
+              f"{first.total_experience_years} "
+              f"{parsed_rows[1]['provider']}={second.total_experience_years}")
+        print()
 
     print("=" * 78)
-    if failures:
-        print(f"RESULT: {len(failures)} correctness failure(s)")
-        for failure in failures:
-            print(f"  - {failure}")
-        return 1
-    print("RESULT: all correctness checks passed")
-    return 0
+    print("RESULT: " + ("all providers passed"
+                        if exit_code == 0 else "see FAIL lines above"))
+    return exit_code
 
 
 def _find_keys(obj: Any, wanted: tuple[str, ...]) -> set[str]:
@@ -576,13 +674,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--verify-trim",
         action="store_true",
-        help="Measure the trimmed ParsedResume against the pre-trim baseline "
+        help="Measure the trimmed ParsedResume on each provider, side by side, "
         "and assert extraction quality; skips the rest of the ladder",
+    )
+    parser.add_argument(
+        "--providers",
+        default="ollama,groq",
+        help="Comma-separated providers for --verify-trim (default: ollama,groq)",
     )
     args = parser.parse_args(argv)
 
     if args.verify_trim:
-        return verify_trim()
+        names = [n.strip() for n in args.providers.split(",") if n.strip()]
+        return verify_trim(names)
 
     settings = get_settings()
     repeats = max(1, args.repeats)

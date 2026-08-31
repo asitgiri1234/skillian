@@ -1520,3 +1520,348 @@ summaries that carried the only job-description-like prose are gone.
 This is the cost named in 20.5, now quantified. `COS_LO`/`COS_HI` must be
 re-derived with `scripts/calibrate_similarity.py` before the semantic component
 is trusted.
+
+---
+
+# Decisions — Day 3c (real Adzuna data, Groq as parse provider)
+
+Two changes: the Adzuna credentials became real, so the first genuine corpus
+exists; and resume parsing moved to a hosted provider with a local fallback.
+
+---
+
+## 22. Groq as the parse provider
+
+### 22.1 Structured output mode: full JSON schema, not loose JSON
+
+**Found by probing the live API, not by reading docs.** Groq's first response to
+`ParsedResume.model_json_schema()` was a 400:
+
+    invalid JSON schema for response_format: 'ParsedResume':
+    /$defs/ProjectRef: `additionalProperties:false` must be set on every object
+
+That is a **schema-shape requirement, not a missing feature**, and the
+distinction matters more than it looks. Read as "json_schema is unsupported",
+the obvious next move is to fall back to `{"type": "json_object"}` — loose mode,
+which guarantees only *some* JSON and silently transfers responsibility for
+field names and types onto the validate-and-retry loop in `app.structure`. The
+grammar would be gone and nothing would say so.
+
+`groq_llm.harden_schema()` adds `additionalProperties: false` and a full
+`required` list to every object node, including the `$defs`. With that,
+`json_schema` + `strict: true` works on every model tried, and behaviour mirrors
+Ollama's `format=` exactly: malformed shape stays unrepresentable, and the retry
+loop in `structure.py` stays scoped to *accuracy*, which is what it was written
+for.
+
+So: **full schema support. The validate-and-retry loop did not become load
+bearing.**
+
+### 22.2 httpx, not the `groq` SDK
+
+httpx is already a dependency for the job sources, the surface used here is one
+endpoint, and an SDK would be another package to pin for no capability needed.
+
+### 22.3 Model choice: `qwen/qwen3.8-27b`, chosen 2026-08-31
+
+`llama-3.3-70b-versatile` — the plausible-looking default — **does not exist on
+this account**. The model list was fetched from `/openai/v1/models` and all three
+viable candidates were measured on the same 600-word resume rather than picked
+by reputation:
+
+| Model | Time | Completion tokens | of which hidden *reasoning* | Quality |
+|---|---|---|---|---|
+| `openai/gpt-oss-120b` | 3.99s | 1187 | **894** | 27 skills, 0 missed |
+| `openai/gpt-oss-20b` | 3.07s | 1295 | **996** | 27 skills, 0 missed |
+| **`qwen/qwen3.8-27b`** | **2.50s** | **367** | 0 | 27 skills, 0 missed |
+
+All three were **quality-identical**. The decider was token cost against a free
+tier metered at 8000 tokens/minute: the gpt-oss models spend 75-77% of their
+completion budget on hidden reasoning tokens that are billed, counted against
+the limit, and thrown away. qwen3.8 emits none, is the fastest, and is the same
+family as the local `qwen2.5:7b`, so prompt behaviour is consistent across the
+primary and the fallback.
+
+**The model list moves.** Re-run the listing before changing `GROQ_MODEL` rather
+than assuming any of these still exist.
+
+### 22.4 Groq parses resumes; Ollama still does everything else
+
+`PARSE_PROVIDER=groq` is deliberately narrower than `LLM_PROVIDER`, and the two
+are separate settings:
+
+- **Resume parsing** is one call per upload, and it is the only thing a user sits
+  and waits for. It goes to Groq.
+- **Job-skill extraction and match explanations** run per-job inside a search —
+  80 to 200 calls — and stay on `LLM_PROVIDER=ollama`, because Groq's free tier
+  is metered per minute and a search would spend the whole budget in one run.
+
+`get_parse_provider()` is a separate factory from `get_llm_provider()` for this
+reason, and `app/structure.py` is the only caller.
+
+**Follow-up worth taking, with numbers rather than a hunch:** the 80-job
+ingestion in 23.1 spent ~100 minutes in Ollama skill extraction. Those
+descriptions are ~500 chars, so roughly 600 tokens per call, ~48,000 tokens
+total — about 6 minutes at 8000 TPM. Routing stage (d) to Groq is very likely a
+10x win on the slowest stage of the pipeline. Not done here: it is a change to
+search behaviour, not to parsing, and it belongs in its own pass with its own
+measurement.
+
+### 22.5 Fallback is per call, and logged
+
+`FallbackLLMProvider` tries Groq and, on any `LLMError`, retries that call on
+Ollama at WARNING. Rationale:
+
+- **A resume upload must not fail because the network is down.** The project's
+  premise (13.3) is that everything runs locally; a hosted dependency that could
+  take the feature down with it would be a straight downgrade.
+- **Per call, not per process.** A transient outage must not pin the application
+  to the 100-second path until it restarts, and a persistent one should surface
+  on every request rather than in one log line that scrolled away hours ago.
+- **WARNING, not ERROR**, because the call is about to succeed — but it must be
+  visible, since silent degradation to a 70x slower path is exactly what goes
+  unnoticed until a demo.
+
+`EMBEDDING_PROVIDER` stays `ollama`: Groq serves no embedding endpoint, and
+local batched embeddings already measured 0.51s/chunk.
+
+### 22.6 Free-tier rate limits, observed 2026-08-31
+
+From response headers on `qwen/qwen3.8-27b`:
+
+| Header | Value |
+|---|---|
+| `x-ratelimit-limit-requests` | 1000 |
+| `x-ratelimit-limit-tokens` | 8000 |
+| `x-ratelimit-reset-requests` | ~4m19s (observed, decreasing) |
+| `x-ratelimit-reset-tokens` | ~8s |
+
+The token bucket refills on the order of seconds, so 8000 reads as **tokens per
+minute**; requests reset on a much longer horizon, so 1000 reads as **requests
+per day**. One resume upload costs ~1,430 tokens (1060 prompt + 367 completion),
+so a single upload uses roughly **18% of one minute's token budget** and 0.1% of
+the daily request budget. Nowhere near a limit for the demo path — but the
+per-minute ceiling is exactly why 22.4 keeps per-job extraction off Groq, and
+it is the number to check first if a bulk path is ever pointed at it.
+
+### 22.7 Measured: 1.44s against 203.83s
+
+Same fixture, same schema, same temperature, run back to back
+(`benchmark_llm.py --verify-trim`):
+
+| | Model | Out tok | Seconds | tok/s | Skills | Quality |
+|---|---|---|---|---|---|---|
+| baseline (recorded) | qwen2.5:7b | 941 | 217.1 | 4.33 | — | — |
+| ollama | qwen2.5:7b | 483 | 203.83 | 2.37 | 27 | PASS |
+| **groq** | qwen/qwen3.8-27b | **367** | **1.44** | **254.50** | 27 | PASS |
+
+**Quality is identical, and that is the result that matters.** The skill-set diff
+between the two providers is empty in both directions — same 27 skills, same
+`total_experience_years` of 7.0, same 4 roles, 2 projects, 1 education entry.
+Every correctness assertion passed on both.
+
+Two honest caveats on the timing:
+
+- **The Ollama row is contended.** It ran at 2.37 tok/s against the 4.79 tok/s
+  measured on a quiet machine, because the 80-job ingestion in 23.1 was doing
+  skill extraction on the same CPU at the time. Against the clean 100.9s figure
+  from 21, Groq is ~**70x** faster, not 141x. The honest range is 70-140x
+  depending on what else the machine is doing — which is itself an argument for
+  the hosted provider, since it is unaffected by local load.
+- **Token drift is 24%** (367 vs 483), just inside the 25% threshold the script
+  flags at. This is not a schema-handling difference: the *content* is
+  identical, so it is the two models formatting the same information slightly
+  differently (whitespace, key ordering). Same schema, same temperature,
+  different model — 24% is expected. It would be worth investigating if the
+  extracted content differed, and it does not.
+
+---
+
+## 23. Real Adzuna data
+
+### 23.1 Credentials verified, and the shape assumptions finally checked
+
+`scripts/verify_adzuna.py` (new) is the gate. It goes through `AdzunaSource`
+rather than raw httpx, so a pass means the real ingestion path works, and it
+prints the upstream status *and body* on failure because 401 (bad key) and 403
+(key not yet activated) need different responses.
+
+Day 1's response-shape assumptions held: `created` parsed to a date on 3/3 rows,
+currency matched the country, `apply_url` and `company` present.
+
+**The one that did not: `description` is truncated to 500 characters.** Adzuna's
+search endpoint returns a teaser, not the posting. Two consequences, neither of
+which was visible with the hand-written fixtures:
+
+- **Every job produces exactly one chunk.** The chunker targets 200-400 tokens
+  and 500 chars is ~90 tokens, so `chunk_description` returns a single chunk for
+  essentially every real posting. The top-3-mean in `semantic_component` (16.2)
+  therefore degenerates to "the only chunk" on this corpus. The design is not
+  wrong, but its central mechanism is inert against this source, and that is
+  worth knowing before concluding anything about chunking from these numbers.
+- **Skill extraction has far less to read**, so recall per job is bounded by the
+  teaser rather than by the model.
+
+Fixing it means fetching each posting's own page, which is a scraping change,
+out of scope here and recorded rather than done.
+
+### 23.2 The stored resume was re-parsed before ingestion
+
+The one resume in the database still had the pre-trim keys
+(`total_years_experience`, `experience[].title`) and an embedding built from
+prose — exactly the staleness predicted in 20.6. Calibrating the new noun-based
+band against an old prose-based embedding would have measured nothing, so the
+resume was re-parsed under the trimmed schema, re-embedded, its skills relinked
+and its matches dropped, before the search ran.
+
+The 12 synthetic `source='local'` jobs from day-3 verification were deleted for
+the same reason: they were hand-written to be easy, and leaving them in would
+have flattered the corpus.
+
+---
+
+# Decisions — Day 3d (dictionary skill extraction)
+
+**Provisional.** Committed as a trial so it can be exercised on real data. Two
+known problems are recorded below unfixed (24.4, 24.5); read them before
+trusting a match score from this corpus.
+
+---
+
+## 24. Pipeline stage (d): dictionary lookup, not an LLM
+
+### 24.1 Why the generative call had to go
+
+Stage (d) made one constrained-decoding call per job at roughly **45 seconds**.
+For the 80-job Adzuna run that is an hour of wall clock, and the run was killed
+at 19/80 rather than waiting it out.
+
+The model was not reasoning about anything. It was reading technology names out
+of a document and writing them back — a lookup, dressed as generation.
+
+| | LLM | Dictionary |
+|---|---|---|
+| 80 jobs | ~45s/job, ~60 min | **1.27s** |
+| Per job | ~45,000ms | **15.9ms** |
+| Index build | — | 0.20s, once per process |
+
+**What is genuinely lost:** a dictionary cannot find what it does not know. The
+LLM discovered names nobody had entered. Two mitigations, neither complete: the
+vocabulary grows from every resume parse, and `skill_seed.py` provides a base.
+A posting naming something novel now yields nothing for that term, and
+`skill_component` reports it as *unparsed* rather than as a mismatch — which is
+the honest failure mode, and the one the day-3 `None`-not-`0.0` decision (16.5)
+was built for.
+
+### 24.2 The canonical-form filter, and the bug it started as
+
+`build_index` skips any row where ``clean_skill_name(name) != [name]``.
+
+The first version tested ``if not clean_skill_name(name)`` — "does this clean to
+something non-empty" — and that is wrong in a way worth recording, because it
+cost a debugging session and was caught by a test rather than by reading:
+
+* `"Strong Python"` is a real row in `skills`, written by the pre-fix LLM path.
+* `clean_skill_name("Strong Python")` returns `["Python"]`, which is truthy, so
+  the non-empty check **kept it**.
+* Being longer than `"Python"`, it then won longest-first matching.
+* It resolved to *its own* `skill_id` — a different row from the one the resume
+  canonicalised onto.
+* The job said Python, the resume said Python, and the intersection was empty.
+
+Testing for *already canonical* raises the skip count from 19 rows to 61 and
+fixes it. Rows are filtered at index time rather than deleted, because
+`job_skills` and `resume_skills` still reference them.
+
+### 24.3 Short names need positive evidence
+
+`R`, `Go`, `C`, `C#`, `D`, `js` are real skills whose names are also ordinary
+English. A false positive here is not cosmetic: a job wrongly tagged `Go`
+matches every Go developer.
+
+Rules, in order:
+
+1. **An adjacent `&` disqualifies outright.** "R&D" is one idiom.
+2. List punctuation on either side accepts — `Python, Go, Rust`.
+3. An *immediately adjacent* qualifier token accepts — "Go developer".
+
+Two details that were wrong in the first draft:
+
+* **Start-of-string is not evidence.** Treating position 0 as a list boundary
+  matches "Go to our website".
+* **The qualifier check must be adjacency, not a window.** A 24-character window
+  containing `engineer` passed "R&D engineer", because `engineer` appears in
+  essentially every job description. Only the neighbouring token counts now.
+
+### 24.4 OPEN: the vocabulary still contains non-skills
+
+`Backend Engineer` is the **single most-matched "skill" in the corpus (25 of 80
+jobs)**, alongside `architecture`, `Databases`, `backend systems`, `Architect`
+and `APIs`. These are job titles and vague nouns that earlier LLM runs wrote
+into `skills`. They are short and well-formed, so the canonical-form filter in
+24.2 does not catch them, and they inflate the skill component of every score.
+
+Not fixed here: pruning rows is a data decision with foreign-key implications
+and belongs in its own pass. The likely fix is a blocklist of job-title and
+abstract-noun forms applied at index time, mirroring 24.2.
+
+### 24.5 OPEN: the required/preferred split is untested on real data
+
+**All 246 extracted rows came back `required`. Zero `preferred`.**
+
+Not a bug in the splitter — it is verified against synthetic input and by 45
+unit tests. The cause is 23.1: Adzuna truncates descriptions at 500 characters,
+and a "nice to have" section essentially never appears that early. One sample
+posting opens with "Must have :" and is cut off before reaching anything else.
+
+Consequence: `SKILL_WEIGHTS["preferred"] = 0.4` is **currently dead code against
+this corpus**, and every job's skill score is computed as though every named
+skill were mandatory. It will start mattering the moment descriptions are
+fetched in full.
+
+### 24.6 The seed vocabulary
+
+`app/matching/skill_seed.py` — ~150 technologies with alias forms.
+
+Needed because the `skills` table had **225 rows and zero aliases**: the alias
+column existed but had never been populated, so `k8s` could not reach Kubernetes
+and `js` could not reach JavaScript. Dictionary matching without aliases throws
+away most of its own mechanism.
+
+Seeding is idempotent and non-destructive — an existing row keeps its id, so
+every `job_skills` and `resume_skills` reference survives, and aliases are merged
+rather than replaced. First run: 83 added, 31 alias-backfilled.
+
+### 24.7 The index loads lazily, not at module import
+
+The spec said "at module import". It is a lazily-built process-wide cache
+instead, because importing `app.matching` must not require a live database —
+`pytest` collection, Alembic and `--help` all import this package, and an
+import-time query would fail every one of them without Postgres. "Once per
+process" is the property that matters and is preserved. `reset_index()` exists
+for tests and for after seeding.
+
+### 24.8 Extraction reads the title as well as the description
+
+Aggregator postings truncate the body, and the title is often the only place a
+technology is named ("Python Developer"). This is also what makes 24.4 worse
+than it would otherwise be: the junk row `Backend Engineer` matches the *title*
+of 25 postings.
+
+### 24.9 Measured on 80 real Adzuna postings
+
+| | |
+|---|---|
+| Wall clock, 80 jobs | **1.274s** (15.9ms/job) |
+| Jobs with >= 1 skill | 56 |
+| Jobs with zero skills | 24 |
+| — of which pure boilerplate teaser | **22** |
+| — genuine extraction misses | **2** |
+| `job_skills` rows | 246 (avg 4.4 per job) |
+| Requirement split | 246 required, **0 preferred** |
+
+The zero-skill number reads badly until it is broken down. 22 of the 24 are
+postings whose entire 500-character description is an equal-opportunity notice
+with no technology named anywhere — "This job is with X, an inclusive employer
+and a member of myGwork...". The marker phrases did not miss; there was nothing
+to find. That is a source-truncation problem (23.1), not an extraction problem.

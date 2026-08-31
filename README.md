@@ -236,16 +236,66 @@ need Postgres migrated to `0003` and skip cleanly without it. **No test calls
 Ollama** — the LLM and embedding providers are injected everywhere they are used,
 and `tests/conftest.py` supplies deterministic fakes.
 
-## Swapping a model provider
+## Providers: what runs where
 
-`LLM_PROVIDER` and `EMBEDDING_PROVIDER` in `.env` select the implementation from
-the registries in `app/providers/__init__.py`. Callers depend on the ABC and
-never import a concrete provider, so adding a hosted backend is a new file plus
-a registry entry.
+Three settings, because the three workloads have different shapes:
 
+| Setting | Default | Drives | Why |
+|---|---|---|---|
+| `PARSE_PROVIDER` | `groq` | Resume parsing | One call per upload, and the only thing a user waits on. 1.4s hosted vs ~101s local. |
+| `LLM_PROVIDER` | `ollama` | Job-skill extraction, match explanations | 80-200 calls per search; Groq's free tier is metered per minute. |
+| `EMBEDDING_PROVIDER` | `ollama` | All embeddings | Groq serves no embedding endpoint, and local batched embeddings measure 0.51s/chunk. |
+
+`PARSE_PROVIDER` **falls back to `LLM_PROVIDER` automatically** on any Groq
+failure — timeout, 401, rate limit, network down — logging at WARNING. A resume
+upload never fails because the network is down; it just gets slow. Set
+`PARSE_PROVIDER=ollama` to run entirely locally with no hosted dependency.
+
+Measured on the same 600-word resume, same schema, same temperature:
+
+| | Model | Out tok | Seconds | Skills | Quality |
+|---|---|---|---|---|---|
+| ollama | `qwen2.5:7b` | 483 | 100.9 | 27 | PASS |
+| **groq** | `qwen/qwen3.8-27b` | 367 | **1.44** | 27 | PASS |
+
+Quality is identical — the skill-set diff between the two is empty in both
+directions. Re-check with:
+
+```bash
+python scripts/benchmark_llm.py --verify-trim                    # both
+python scripts/benchmark_llm.py --verify-trim --providers ollama # one
+```
+
+**Groq is hosted**, so unlike the rest of this project, resume text leaves the
+machine when `PARSE_PROVIDER=groq`.
+
+Callers depend on the ABC and never import a concrete provider, so adding a
+backend is a new file plus a registry entry in `app/providers/__init__.py`.
 Changing the *embedding model* is not just a config change: `EMBEDDING_DIM` in
 `app/models.py` must match the model's width, and the `vector()` columns need an
 Alembic migration to match. `check_ollama.py` asserts the two agree.
+
+### Choosing a Groq model
+
+`GROQ_MODEL` defaults to `qwen/qwen3.8-27b`, chosen 2026-08-31 by listing the
+API and measuring. **The list moves** — `llama-3.3-70b-versatile` was already
+gone — so verify before changing it:
+
+```bash
+curl -s https://api.groq.com/openai/v1/models \
+  -H "Authorization: Bearer $GROQ_API_KEY" | jq -r '.data[].id' | sort
+```
+
+Watch for hidden **reasoning tokens**: the `gpt-oss` models spent 894-996 of
+their ~1200 completion tokens on reasoning that is billed, counted against the
+rate limit, and discarded. Same answer, three times the token cost.
+
+Structured output uses `response_format: json_schema` with `strict: true`, so
+shape is grammar-guaranteed exactly as Ollama's `format=` is. Groq rejects
+pydantic's schema until every object carries `additionalProperties: false`;
+`groq_llm.harden_schema()` handles that. That 400 is a schema-shape requirement,
+**not** a reason to fall back to loose `json_object` mode — doing so would throw
+the grammar away silently.
 
 ## Extraction: shape vs accuracy
 

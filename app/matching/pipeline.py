@@ -7,18 +7,21 @@ rather than a flat "running" for four minutes:
     a. load the resume and its skills
     b. build search queries          (queries.py, LLM-free)
     c. fetch every enabled source, dedupe on dedup_hash, upsert
-    d. extract + canonicalise job skills                     [LLM, per new job]
+    d. extract job skills by dictionary lookup               [NO model calls]
     e. chunk and embed jobs with no chunks                   [embeddings, batched]
     f. score every job                                       [NO model calls]
     g. bulk write matches
     h. explain the top 20                                    [LLM, capped]
 
 The ordering exists to keep model calls out of the wide part of the funnel.
-Stage f runs over every job in the result set and is pure arithmetic — set
-intersection and a few thousand dot products, seconds for a few hundred jobs. If
-it made one local-model call per job, a 200-job search would take roughly 25
-minutes instead. Stages d and h are the two that do call a model, and both are
-bounded: d by the number of *new* jobs, h by a hard cap of 20.
+Stages d and f both run over *every* job in the result set, and neither calls a
+model. Stage d used to: one generative call per job at ~45 seconds, which made
+an 80-job search an hour long, to read technology names out of a document and
+write them back. It is now a compiled regex over the `skills` vocabulary and
+costs milliseconds for the whole batch (DECISIONS 24). Stage f is set
+intersection and a few thousand dot products.
+
+**Stage h is the only per-item model call left, and it is capped at 20.**
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from app.matching.scorer import (
     ScoreResult,
     score,
 )
-from app.matching.skills import SkillCanonicalizer, extract_job_skills
+from app.matching.jd_skills import extract_skills, get_index
 from app.models import IngestionRun, Job, JobChunk, JobSkill, Match, Resume, ResumeSkill, Skill
 from app.providers import EmbeddingProvider, LLMProvider
 from app.sources.base import JobSource, NormalizedJob
@@ -226,14 +229,22 @@ def _fetch_and_store(
 # --- stage d ----------------------------------------------------------------
 
 
-def _extract_skills_for(
-    session: Session, job_ids: Sequence[UUID], llm: LLMProvider
-) -> int:
-    """Extract and store job_skills for jobs that have none.
+def _extract_skills_for(session: Session, job_ids: Sequence[UUID]) -> int:
+    """Store job_skills for jobs that have none, by dictionary lookup.
 
-    Filtered on "has no job_skills rows" rather than on "is new" so that a job
-    whose extraction failed or was interrupted last run gets another chance,
-    while a job already processed is never re-read by the model.
+    **No LLM.** This stage used to make one generative call per job at ~45s
+    each; 80 jobs was an hour of wall clock spent reading technology names out
+    of a document and writing them back. `app.matching.jd_skills` does the whole
+    batch in well under a second against a compiled regex over the `skills`
+    vocabulary. See DECISIONS 24.
+
+    Filtered on "has no job_skills rows" rather than on "is new", so a job whose
+    extraction was interrupted last run gets another chance while one already
+    processed is skipped.
+
+    No ``canonicalize`` step: the index maps surface forms straight to
+    ``skills.id``, so a hit is already canonical. That is the other half of the
+    speedup — the LLM path had to reconcile free text back onto rows.
     """
     if not job_ids:
         return 0
@@ -247,47 +258,53 @@ def _extract_skills_for(
     if not pending:
         return 0
 
-    canonicalizer = SkillCanonicalizer(session)
+    index = get_index(session)
     processed = 0
+    empty = 0
 
     for job_id in pending:
         job = session.get(Job, job_id)
         if job is None:
             continue
-        extracted = extract_job_skills(job.title, job.description, llm)
-        if not extracted:
+
+        # Title as well as description: aggregator postings truncate the body
+        # (Adzuna caps it at 500 chars) and the title often carries the only
+        # technology name in the record.
+        text = f"{job.title}\n\n{job.description or ''}"
+        hits = extract_skills(text, index)
+        if not hits:
             # Left with zero rows on purpose. skill_component reads that as
             # "requirements unparsed" and falls back to semantic scoring, which
-            # is the honest answer for a posting with no readable requirements.
+            # is the honest answer for a posting naming nothing we recognise.
+            empty += 1
             continue
 
-        rows: list[dict[str, Any]] = []
-        seen: set[UUID] = set()
-        for item in extracted:
-            if not item.name:
-                continue
-            skill_id = canonicalizer.canonicalize(item.name)
-            if skill_id is None or skill_id in seen:
-                continue
-            seen.add(skill_id)
-            rows.append(
-                {"job_id": job_id, "skill_id": skill_id, "requirement": item.requirement}
+        session.execute(
+            pg_insert(JobSkill)
+            .values(
+                [
+                    {
+                        "job_id": job_id,
+                        "skill_id": hit.skill_id,
+                        "requirement": hit.requirement,
+                    }
+                    for hit in hits
+                ]
             )
-
-        if rows:
-            session.execute(
-                pg_insert(JobSkill)
-                .values(rows)
-                # A concurrent run may have inserted the same pair already; the
-                # requirement it chose is as good as ours.
-                .on_conflict_do_nothing(index_elements=["job_id", "skill_id"])
-            )
+            # A concurrent run may have inserted the same pair already.
+            .on_conflict_do_nothing(index_elements=["job_id", "skill_id"])
+        )
         processed += 1
-        # Commit per job: extraction is slow, and a crash on job 90 of 100 must
-        # not discard the 89 that already cost a minute of model time each.
-        session.commit()
 
-    logger.info("Extracted skills for %s job(s)", processed)
+    # One commit for the batch, not one per job. The per-job commit existed
+    # because each job cost a minute of model time worth protecting; the whole
+    # batch is now sub-second and a partial commit buys nothing.
+    session.commit()
+
+    logger.info(
+        "Extracted skills for %s job(s); %s matched nothing in the vocabulary",
+        processed, empty,
+    )
     return processed
 
 
@@ -567,7 +584,7 @@ def run_search(
             jobs_found=outcome.jobs_found,
         )
 
-        _extract_skills_for(session, job_ids, llm)
+        _extract_skills_for(session, job_ids)
 
         _set_stage(session, run_id, run_status.STAGE_EMBEDDING)
         outcome.chunks_written = _chunk_and_embed(session, job_ids, embedder)

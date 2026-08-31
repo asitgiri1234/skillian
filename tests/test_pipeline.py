@@ -279,8 +279,9 @@ class TestPipelineWork:
             assert match.overall_score is not None
             assert 0 <= match.overall_score <= 1
             assert match.model_version is not None
-            # The fake LLM reports Python + PostgreSQL (required) and Kubernetes
-            # (preferred); the resume holds the first two.
+            # Dictionary extraction, not the LLM: DESCRIPTION names Python and
+            # PostgreSQL (which the resume holds) and Kubernetes (which it does
+            # not), and all three are in the seeded vocabulary.
             assert "Python" in (match.matching_skills or [])
             assert "Kubernetes" in (match.missing_skills or [])
 
@@ -307,12 +308,16 @@ class TestPipelineWork:
         )
         assert indexes == list(range(len(indexes)))
 
-    def test_scoring_makes_no_model_calls(
+    def test_only_explanations_call_a_model(
         self, db_session, session_factory, resume_row, fake_llm, fake_embedder
     ):
         """The pipeline's central performance claim, asserted rather than
-        commented: one skill-extraction call per new job, one explanation call
-        per top match, and nothing at all for scoring."""
+        commented.
+
+        Stage (d) used to make one generative call per job. It is now a
+        dictionary lookup, so the *only* per-item model call left is the
+        explanation in stage (h), and `complete` is never called at all.
+        """
         jobs = [_job(i) for i in range(5)]
         run = create_search_run(db_session, resume_row.id, ["fake"])
         run_search(
@@ -324,8 +329,9 @@ class TestPipelineWork:
             embedder=fake_embedder,
             session_factory=session_factory,
         )
-        # Exactly one extraction per job — not one per job plus one per score.
-        assert len(fake_llm.complete_calls) == 5
+        # Zero structured calls: skill extraction no longer uses a model.
+        assert fake_llm.complete_calls == []
+        # One explanation per job, since 5 is under the cap of 20.
         assert len(fake_llm.complete_text_calls) == 5
 
     def test_explanations_are_capped_at_twenty(
@@ -538,11 +544,28 @@ class TestUnparsedRequirements:
         self, db_session, session_factory, resume_row, fake_embedder
     ):
         """No job_skills rows -> skills_unparsed -> semantic-only, and the match
-        still exists rather than being dropped or zeroed."""
+        still exists rather than being dropped or zeroed.
+
+        The trigger is now a description naming nothing in the vocabulary,
+        rather than an LLM that returned an empty list. This is the common real
+        case: 22 of 80 Adzuna postings came back as pure equal-opportunity
+        boilerplate with no technology named anywhere.
+        """
         from tests.conftest import FakeLLMProvider
 
         silent_llm = FakeLLMProvider(skills_response={"skills": []})
-        posting = _job(0)
+        posting = _job(0).model_copy(
+            update={
+                "title": "Regional Coordinator",
+                "description": (
+                    "This job is with an inclusive employer and a member of a "
+                    "global platform for the business community. Please do not "
+                    "contact the recruiter directly. We welcome applicants "
+                    "from every background and make reasonable accommodations "
+                    "throughout the hiring process for anyone who needs them."
+                ),
+            }
+        )
         run = create_search_run(db_session, resume_row.id, ["fake"])
         run_search(
             run_id=run.id,

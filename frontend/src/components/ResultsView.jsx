@@ -3,6 +3,7 @@ import { getMatches } from '../api/client'
 import { ErrorNotice, describeError } from './ErrorNotice'
 import { JobDetail } from './JobDetail'
 import { MatchCard } from './MatchCard'
+import { ResetControl } from './ResetControl'
 import { SkillsPanel } from './SkillsPanel'
 
 const PAGE_SIZE = 25
@@ -14,7 +15,7 @@ const PAGE_SIZE = 25
  * without a reload, and the list keeps its scroll position because it never
  * unmounts.
  */
-export function ResultsView({ resume, jobsFound, onRestart, onSkillsUpdated }) {
+export function ResultsView({ resume, jobsFound, onRestart, onReset, onSkillsUpdated }) {
   const resumeId = resume.id
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -91,6 +92,17 @@ export function ResultsView({ resume, jobsFound, onRestart, onSkillsUpdated }) {
   return (
     <div className="results">
       <div className="results__list">
+        {/* Top of the page, beside the resume summary the skills panel opens. */}
+        <div className="reset">
+          <span className="reset__resume">
+            {resume.parsed?.name || resume.label || 'Your resume'}
+          </span>
+          <ResetControl
+            matchCount={ranked.total + unparsed.total}
+            onReset={onReset}
+          />
+        </div>
+
         {/* Above the list, not a third column: three columns do not fit on a
             laptop, and this is used occasionally rather than constantly. */}
         <SkillsPanel

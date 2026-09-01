@@ -19,6 +19,10 @@ export default function App() {
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState(null)
   const [finishedRun, setFinishedRun] = useState(null)
+  // Bumped on reset so UploadView remounts with a brand-new <input type=file>.
+  // Browsers do not fire `change` when the same file is re-selected unless the
+  // input has been cleared, and a fresh DOM node is the surest way to clear it.
+  const [uploadKey, setUploadKey] = useState(0)
 
   async function startSearch() {
     if (!resume) return
@@ -59,6 +63,31 @@ export default function App() {
     }
   }
 
+  /**
+   * Back to a blank upload view.
+   *
+   * Every piece of per-resume state goes, not just the view flag. A surviving
+   * `resume` would be the real bug here: ResultsView keys its fetch on
+   * `resume.id`, so a leftover id would quietly render the *previous* resume's
+   * matches under a newly uploaded one.
+   *
+   * Clearing `runId` unmounts PollingView, and useRunPoller's effect cleanup
+   * clears its timer and aborts the in-flight request — so no poller survives
+   * a reset even if one was still running.
+   *
+   * `email` is kept: it is the same person. Nothing is deleted server-side —
+   * the old resume and its matches stay keyed to their own resume_id, orphan
+   * nothing, and remain reachable by user_id.
+   */
+  function resetAll() {
+    setResume(null)
+    setRunId(null)
+    setFinishedRun(null)
+    setSearchError(null)
+    setSearching(false)
+    setUploadKey((k) => k + 1)
+  }
+
   function restart() {
     // Clearing runId is what unmounts PollingView and stops its poller.
     setRunId(null)
@@ -76,12 +105,14 @@ export default function App() {
           resume={resume}
           jobsFound={finishedRun.jobs_found}
           onRestart={restart}
+          onReset={resetAll}
           onSkillsUpdated={handleSkillsUpdated}
         />
       ) : runId ? (
         <PollingView runId={runId} onRestart={restart} onDone={setFinishedRun} />
       ) : (
         <UploadView
+          key={uploadKey}
           email={email}
           onEmailChange={setEmail}
           resume={resume}

@@ -341,3 +341,24 @@ body {
   background: none; border: 0; padding: 0 0 16px; cursor: pointer;
 }
 @media (max-width: 900px) { .detail__back { display: block; } }
+
+/* --- reset control ------------------------------------------------------- */
+
+.reset {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 4px;
+}
+.reset__resume {
+  font-family: var(--display); font-weight: 500; font-size: 13px;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint);
+}
+.reset__link {
+  font: inherit; font-size: 13px; color: var(--ink-faint);
+  background: none; border: 0; padding: 0; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px;
+}
+.reset__link:hover { color: var(--ink); }
+.reset__confirm { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.reset__question { font-size: 13px; color: var(--ink); }
+.button--small { padding: 5px 12px; font-size: 12px; }

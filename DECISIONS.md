@@ -2766,3 +2766,34 @@ interpreted as an escape rather than passed through as regex source. The pattern
 silently never matched, and unit-testing the regex in isolation passed because
 the isolated copy did not contain the stray byte. It was only caught by reading
 the module the dev server actually served.
+
+---
+
+## 37. Frontend reset is a UI reset, not a delete
+
+"Upload a different resume" clears every piece of per-resume state — resume id,
+run id, both match buckets, the selected job, both page positions, the skills
+panel and any error — and returns to the upload view.
+
+**The surviving-`resume.id` case is the bug worth naming.** `ResultsView` keys
+its fetch on `resume.id`, so a leftover id would quietly render the *previous*
+resume's matches underneath a newly uploaded one — a wrong answer that looks
+entirely plausible. Clearing the view flag alone would do exactly that.
+
+`email` is deliberately kept: it is the same person, and re-typing it is
+friction for no benefit.
+
+The file input is remounted (via a `key` bumped on reset) rather than merely
+cleared. Browsers do not fire `change` when the same file is re-selected unless
+the input has been reset, so without this a user who resets and picks the same
+resume again gets silence.
+
+**Nothing is deleted server-side, and that is correct.** The previous resume and
+its matches stay keyed to their own `resume_id`; nothing is orphaned, and the
+row remains reachable by `user_id`. A delete call here would destroy data the
+backend is designed to keep, to solve a problem that is purely about what is on
+screen.
+
+Confirmation is inline rather than `confirm()` — a native dialog steals focus,
+cannot be styled and reads as a browser error. It appears only when there are
+matches to lose; with an empty result set the reset is immediate.

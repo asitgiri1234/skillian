@@ -159,8 +159,29 @@ export function getRun(runId, { signal } = {}) {
   return request(`/runs/${runId}`, { signal })
 }
 
-export function getMatches({ resumeId, limit = 25, offset = 0, minScore, signal } = {}) {
-  const params = new URLSearchParams({ resume_id: resumeId, limit, offset })
+/**
+ * Both buckets arrive in one response, each paged independently.
+ *
+ * `min_score` filters `ranked` only. The unparsed bucket scores on semantics
+ * alone, so a threshold tuned against blended scores would mean something
+ * different there; the API enforces that and this mirrors it.
+ */
+export function getMatches({
+  resumeId,
+  limit = 25,
+  offset = 0,
+  unparsedLimit = 25,
+  unparsedOffset = 0,
+  minScore,
+  signal,
+} = {}) {
+  const params = new URLSearchParams({
+    resume_id: resumeId,
+    limit,
+    offset,
+    unparsed_limit: unparsedLimit,
+    unparsed_offset: unparsedOffset,
+  })
   if (minScore != null) params.set('min_score', minScore)
   return request(`/matches?${params}`, { signal })
 }

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { createSearch } from './api/client'
 import { PollingView } from './components/PollingView'
+import { ResultsView } from './components/ResultsView'
 import { UploadView } from './components/UploadView'
 import './App.css'
 
@@ -17,6 +18,7 @@ export default function App() {
   const [runId, setRunId] = useState(null)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState(null)
+  const [finishedRun, setFinishedRun] = useState(null)
 
   async function startSearch() {
     if (!resume) return
@@ -24,6 +26,7 @@ export default function App() {
     setSearchError(null)
     try {
       const run = await createSearch({ resumeId: resume.id })
+      setFinishedRun(null)
       setRunId(run.run_id)
     } catch (cause) {
       setSearchError(cause)
@@ -35,13 +38,20 @@ export default function App() {
   function restart() {
     // Clearing runId is what unmounts PollingView and stops its poller.
     setRunId(null)
+    setFinishedRun(null)
     setSearchError(null)
   }
 
   return (
-    <main className="app">
-      {runId ? (
-        <PollingView runId={runId} onRestart={restart} />
+    <main className={finishedRun ? 'app app--wide' : 'app'}>
+      {finishedRun ? (
+        <ResultsView
+          resumeId={resume.id}
+          jobsFound={finishedRun.jobs_found}
+          onRestart={restart}
+        />
+      ) : runId ? (
+        <PollingView runId={runId} onRestart={restart} onDone={setFinishedRun} />
       ) : (
         <UploadView
           email={email}

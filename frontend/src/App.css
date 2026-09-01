@@ -94,3 +94,87 @@ body {
 .notice__title { margin: 0 0 6px; font-weight: 600; }
 .notice__detail { margin: 0 0 6px; }
 .notice__hint { margin: 0 0 10px; color: var(--muted); }
+
+/* --- results: split view ------------------------------------------------ */
+
+.app--wide { max-width: 1240px; }
+
+.results { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .results { grid-template-columns: 1fr; } }
+
+.results__list { min-width: 0; }
+.results__header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.results__header .title { margin: 0; }
+
+.cards { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.card {
+  display: block; width: 100%; text-align: left;
+  font: inherit; color: inherit; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: 5px; padding: 12px 14px;
+}
+.card:hover { border-color: #bfbfbf; }
+.card--selected { border-left-color: var(--accent); background: #f7faff; }
+
+.card__head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.card__title { font-weight: 600; }
+.card__score { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--muted); }
+.card__meta { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.card__badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.card__why { margin: 8px 0 0; font-size: 13px; line-height: 1.5; }
+
+/* Tier colour is deliberately muted and always paired with a text label —
+   colour alone is unreadable for roughly 1 in 12 men. */
+.badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 3px; border: 1px solid; }
+.badge--strong   { background: #eef7ef; border-color: #b6d7bb; color: #2f6b3a; }
+.badge--moderate { background: #fdf6e8; border-color: #e2cd9a; color: #7a5a12; }
+.badge--weak     { background: #fbf0f0; border-color: #dfb6b6; color: #8a3b3b; }
+.badge--thin     { background: #f2f2f2; border-color: #d0d0d0; color: #555; font-weight: 500; }
+
+.tag { font-size: 11px; margin-left: 6px; padding: 1px 6px; border-radius: 3px; background: #eef2f8; color: #33507a; }
+
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 24px; }
+.pager__status { font-size: 13px; color: var(--muted); }
+
+.unparsed { border-top: 1px solid var(--line); padding-top: 14px; }
+.unparsed__toggle {
+  font: inherit; font-weight: 600; background: none; border: 0;
+  padding: 0; cursor: pointer; color: var(--ink); text-align: left;
+}
+.unparsed__note { font-size: 13px; color: var(--muted); margin: 8px 0 12px; }
+
+/* --- detail panel ------------------------------------------------------- */
+
+.detail {
+  position: sticky; top: 40px; min-width: 0;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  padding: 22px; max-height: calc(100vh - 80px); overflow-y: auto;
+}
+.detail--empty { display: flex; align-items: center; justify-content: center; min-height: 200px; }
+.detail__title { margin: 0 0 4px; font-size: 19px; }
+.detail__company { margin: 0 0 2px; color: var(--muted); }
+.detail__facts { margin: 0 0 18px; font-size: 13px; color: var(--muted); }
+.detail__section { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+.detail__heading { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+.detail__description { white-space: pre-wrap; font-size: 14px; line-height: 1.6; margin: 0; }
+
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 620px) { .compare { grid-template-columns: 1fr; } }
+.compare__label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.03em; }
+.compare__label--have { color: #2f6b3a; }
+.compare__label--missing { color: #8a3b3b; }
+
+.chip--have     { background: #eef7ef; border-color: #b6d7bb; }
+.chip--missing  { background: #fbf0f0; border-color: #dfb6b6; }
+.chip--required { background: #f0f4fb; border-color: #b9c8e2; }
+.chip--preferred{ background: #fafafa; border-color: var(--line); color: var(--muted); }
+
+/* The machinery: visible to a reviewer, ignorable by a job seeker. */
+.breakdown { margin-top: 18px; font-size: 13px; }
+.breakdown summary { cursor: pointer; color: var(--muted); }
+.breakdown__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 12px 0; }
+.breakdown__grid dt { font-size: 11px; color: var(--muted); margin: 0; text-transform: uppercase; letter-spacing: 0.03em; }
+.breakdown__grid dd { margin: 2px 0 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.breakdown__note { color: var(--muted); margin: 0 0 4px; line-height: 1.5; }

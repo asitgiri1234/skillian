@@ -17,6 +17,16 @@ export function PollingView({ runId, onDone, onRestart }) {
   const { run, error } = useRunPoller(runId)
   const [tick, setTick] = useState(0)
 
+  const failed = run?.is_terminal && (run.status === 'failed' || Boolean(run.error))
+  const done = run?.is_terminal && !failed
+
+  // Handing off in an effect, not during render: setting parent state while a
+  // child renders is what produces "Cannot update a component while rendering
+  // a different component".
+  useEffect(() => {
+    if (done) onDone(run)
+  }, [done, run, onDone])
+
   useEffect(() => {
     const timer = setInterval(() => setTick((t) => t + 1), ROTATE_MS)
     return () => clearInterval(timer)
@@ -42,9 +52,6 @@ export function PollingView({ runId, onDone, onRestart }) {
     )
   }
 
-  const failed = run.is_terminal && (run.status === 'failed' || Boolean(run.error))
-  const done = run.is_terminal && !failed
-
   if (failed) {
     return (
       <section className="panel">
@@ -63,23 +70,8 @@ export function PollingView({ runId, onDone, onRestart }) {
     )
   }
 
-  if (done) {
-    // Placeholder. Part 2 replaces this with the results list.
-    return (
-      <section className="panel">
-        <h2 className="title">Search finished</h2>
-        <p className="subtitle">
-          Found <strong>{run.jobs_found}</strong> job
-          {run.jobs_found === 1 ? '' : 's'}
-          {run.status === 'partial' && ' — some sources failed, so this may be incomplete.'}
-        </p>
-        <p className="muted">Results will appear here.</p>
-        <button type="button" className="button button--secondary" onClick={onRestart}>
-          Start another search
-        </button>
-      </section>
-    )
-  }
+  // The effect above hands off; render nothing while the parent swaps views.
+  if (done) return null
 
   const pct =
     run.stage_total > 0 ? Math.round((run.stage_number / run.stage_total) * 100) : 0

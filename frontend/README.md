@@ -11,17 +11,34 @@ The backend must be running on `http://localhost:8000`
 (`uvicorn app.main:app --reload` from the repo root). Override with
 `VITE_API_BASE`.
 
-## What is here (part 1 of 3)
+## What is here (parts 1-2 of 3)
 
-Upload → parse → search → poll. Results display, the job detail panel and the
-skills sidebar are parts 2 and 3.
+Upload → parse → search → poll → results. The skills sidebar and the design
+pass are part 3.
 
 ```
-src/api/client.js        every call to the API; nothing else uses fetch
-src/lib/extractText.js   PDF/DOCX -> plain text, in the browser
+src/api/client.js          every call to the API; nothing else uses fetch
+src/lib/extractText.js     PDF/DOCX -> plain text, in the browser
 src/hooks/useRunPoller.js  polls GET /runs/{id} until is_terminal
-src/components/          UploadView, PollingView, ErrorNotice
+src/components/
+  UploadView    file -> parse -> "Search jobs"
+  PollingView   real stage progress, not a spinner
+  ResultsView   split view: ranked list left, detail right
+  MatchCard     one result; tier badge, thin-evidence badge, explanation
+  JobDetail     full posting, requirements, comparison, score breakdown
+  ErrorNotice   every failure surface
 ```
+
+## Two rules the results view is built on
+
+**Never re-sort or re-rank client-side.** Ranking is computed server-side over
+the complete set. Sorting a page of 25 against itself would silently disagree
+with page 2.
+
+**Tier is colour *and* text, and null is a real value.** Roughly 1 in 12 men
+cannot reliably distinguish red from green, so the word carries the meaning.
+Unparsed matches have `tier: null` and get no badge at all — the backend
+withholds that judgement deliberately and the UI must not invent one.
 
 ## Two API facts this code is built around
 

@@ -2659,3 +2659,110 @@ band that is about to move.
 **Backend is closed at this commit.** Open items, both documented and
 deliberately not acted on: the confidence asymmetry (30.1, now disclosed in the
 explanation text) and the Adzuna boilerplate records (30.4).
+
+---
+
+# Decisions — Frontend labelling (presentation only)
+
+## 36. Tier labels are rank-relative, because the score distribution is compressed
+
+**No backend value changed.** `TIER_STRONG = 0.36` and `TIER_MODERATE = 0.25`
+stand exactly as frozen in 31.2; the scorer is untouched. This is a labelling
+fix in the UI.
+
+### 36.1 The problem
+
+A match at 0.38 was labelled "Strong match", which reads as absurd against the
+0-100 scale everyone carries in their head. But that scale does not apply here.
+`overall_score` is
+
+    (0.6 * recall * confidence + 0.4 * rescaled_cosine) * experience_multiplier
+
+and every factor is bounded well below 1 in practice:
+
+* the cosine is rescaled from a band **0.16 wide** (31.1), so a genuinely good
+  semantic match lands mid-range, not near 1.0;
+* `confidence` caps at 1.0 only at six parsed requirements, and 34% of jobs
+  state one (30.1);
+* recall is rarely 1.0 on a posting that lists ten requirements.
+
+Measured over the 211 ranked matches: **max 0.782, p95 0.5431, p50 0.2878.**
+There is no 90% match in this system by construction, and there never will be.
+
+The number is **rank-like, not exam-like** — it orders jobs correctly, which is
+all it claims to do. The UI was presenting it as exam-like, and absolute
+language ("Strong") plus a percentage invited exactly the comparison the number
+cannot survive.
+
+### 36.2 What changed
+
+| tier | was | now |
+|---|---|---|
+| strong | Strong match | **Top match** |
+| moderate | Worth improving | **Possible fit** |
+| weak | Weak fit | **Unlikely fit** |
+
+Rank-relative wording: "near the top of what was found" is a claim the score can
+support. Colours are unchanged — muted green, amber, red — and each badge still
+carries its text label, so colour is never the only channel.
+
+**The percentage is gone from the card**, replaced by absolute position:
+`#4` set large with `of 85` small beside it, so the number reads as a place in a
+list rather than a mark out of something. Rank is `offset + index + 1`, computed
+from position in the *full* ranked set — on page 2 the first card is #26, not
+#1. The API returns items already ordered, so no client-side sorting is
+involved (and must not be: see the note in ResultsView).
+
+**The raw score stays in the detail panel's breakdown**, beside
+`semantic_score`, `skill_recall`, `skill_confidence` and `parsed_count`. It is
+removed only from the card, where it invites a comparison against a scale it
+does not live on. A reviewer can still see the machinery in one click.
+
+Unparsed matches get no rank and no badge, unchanged from 30.2: they are not
+part of the ranked ordering, so a position in it would be meaningless.
+
+### 36.3 The explanation text had to be relabelled too
+
+The backend's templates open with the old vocabulary — "Strong match.",
+"Decent match.", "Weak fit." — because they are rendered server-side (32.1) and
+the backend is closed. Left alone, a card would read **TOP MATCH** in the badge
+and "Strong match." one line below it, which is the very sentence this change
+exists to remove: on a 0.38 card, "Strong match" is what reads as broken.
+
+`relabelExplanation()` remaps only that opening clause. Every specific claim the
+sentence makes — which skills matched, which are missing, how many requirements
+it rests on — is the backend's and passes through verbatim. This is the one
+place the frontend rewrites server-generated text, and it is deliberately
+narrow: four leading phrases, exact-anchored, no other substitution.
+
+If the backend ever reopens, the correct fix is to change the templates in
+`app/matching/explain.py` and delete this function.
+
+### 36.4 Low confidence matters more now, not less
+
+The "Thin evidence" cue for `parsed_count` of 1 or 2 is unchanged and load
+bearing. A card can now read **"Top match · #6 of 85"** on the strength of a
+single stated requirement. The badge plus the explanation's "Based on only 1
+stated requirement, so treat it as a rough signal" are what keep that honest.
+Across the verification corpus, 55 of 85 ranked cards carried it.
+
+### 36.5 Verified
+
+85 cards across all four pages:
+
+| label | cards | rank range |
+|---|---|---|
+| Top match | 31 | #1-#31 |
+| Possible fit | 14 | #32-#45 |
+| Unlikely fit | 40 | #46-#85 |
+
+Contiguous blocks, as fixed absolute cutoffs over a sorted list must produce.
+Page 2 opens at #26. No "%" appears on any card. Explanations using the old
+vocabulary: **0 of 85**.
+
+A bug worth recording: the first implementation embedded a literal backspace
+byte (0x08) in one regex, because a `\b` written in a non-raw Python heredoc was
+interpreted as an escape rather than passed through as regex source. The pattern
+silently never matched, and unit-testing the regex in isolation passed because
+the isolated copy did not contain the stray byte. It was only caught by reading
+the module the dev server actually served.

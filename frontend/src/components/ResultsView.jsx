@@ -130,10 +130,16 @@ export function ResultsView({ resume, jobsFound, onRestart, onSkillsUpdated }) {
                 over the complete set; re-sorting here would rank one page of 25
                 against itself and silently disagree with page 2. */}
             <ul className="cards">
-              {ranked.items.map((match) => (
+              {ranked.items.map((match, index) => (
                 <MatchCard
                   key={match.job_id}
                   match={match}
+                  /* Absolute position in the full ranked set, not position
+                     within this page: on page 2 the first card is #26. The API
+                     returns items already ordered, so offset + index + 1 is
+                     the rank. */
+                  rank={page * PAGE_SIZE + index + 1}
+                  rankTotal={ranked.total}
                   selected={selected?.job_id === match.job_id}
                   onSelect={setSelected}
                 />

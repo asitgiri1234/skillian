@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { createResume } from '../api/client'
-import { ACCEPTED_EXTENSIONS, extractText } from '../lib/extractText'
+import { ACCEPTED_EXTENSIONS } from '../lib/constants'
 import { ErrorNotice, describeError } from './ErrorNotice'
 
 /**
@@ -31,6 +31,9 @@ export function UploadView({ email, onEmailChange, resume, onParsed, onSearch, s
 
     try {
       setStatus('extracting')
+      // Dynamic import: pdf.js and mammoth are ~1.2MB and nothing needs them
+      // until a file is actually chosen, so they stay out of the initial load.
+      const { extractText } = await import('../lib/extractText')
       const rawText = await extractText(file)
 
       setStatus('parsing')

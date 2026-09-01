@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { getMatches } from '../api/client'
 import { ErrorNotice, describeError } from './ErrorNotice'
 import { JobDetail } from './JobDetail'
 import { MatchCard } from './MatchCard'
+import { SkillsPanel } from './SkillsPanel'
 
 const PAGE_SIZE = 25
 
@@ -13,7 +14,8 @@ const PAGE_SIZE = 25
  * without a reload, and the list keeps its scroll position because it never
  * unmounts.
  */
-export function ResultsView({ resumeId, jobsFound, onRestart }) {
+export function ResultsView({ resume, jobsFound, onRestart, onSkillsUpdated }) {
+  const resumeId = resume.id
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -49,6 +51,16 @@ export function ResultsView({ resumeId, jobsFound, onRestart }) {
   const ranked = data?.ranked
   const unparsed = data?.unparsed
   const rankedPages = ranked ? Math.ceil(ranked.total / PAGE_SIZE) : 0
+  // Suggestions are the skills these jobs actually ask for and the resume
+  // lacks — i.e. exactly the terms that would move the ranking if added.
+  const suggestions = useMemo(() => {
+    const seen = new Set()
+    for (const item of ranked?.items ?? []) {
+      for (const skill of item.missing_skills ?? []) seen.add(skill)
+      for (const skill of item.matching_skills ?? []) seen.add(skill)
+    }
+    return [...seen].sort((a, b) => a.localeCompare(b))
+  }, [ranked])
   const unparsedPages = unparsed ? Math.ceil(unparsed.total / PAGE_SIZE) : 0
 
   if (loading && !data) {
@@ -79,6 +91,14 @@ export function ResultsView({ resumeId, jobsFound, onRestart }) {
   return (
     <div className="results">
       <div className="results__list">
+        {/* Above the list, not a third column: three columns do not fit on a
+            laptop, and this is used occasionally rather than constantly. */}
+        <SkillsPanel
+          resume={resume}
+          suggestions={suggestions}
+          onUpdated={onSkillsUpdated}
+        />
+
         <header className="results__header">
           <h2 className="title">
             {ranked.total} match{ranked.total === 1 ? '' : 'es'}
@@ -169,7 +189,7 @@ export function ResultsView({ resumeId, jobsFound, onRestart }) {
         </section>
       </div>
 
-      <JobDetail match={selected} />
+      <JobDetail match={selected} onClose={() => setSelected(null)} />
     </div>
   )
 }

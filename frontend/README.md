@@ -11,10 +11,9 @@ The backend must be running on `http://localhost:8000`
 (`uvicorn app.main:app --reload` from the repo root). Override with
 `VITE_API_BASE`.
 
-## What is here (parts 1-2 of 3)
+## What is here
 
-Upload → parse → search → poll → results. The skills sidebar and the design
-pass are part 3.
+Upload → parse → search → poll → results → edit skills → re-run. Complete.
 
 ```
 src/api/client.js          every call to the API; nothing else uses fetch
@@ -26,8 +25,32 @@ src/components/
   ResultsView   split view: ranked list left, detail right
   MatchCard     one result; tier badge, thin-evidence badge, explanation
   JobDetail     full posting, requirements, comparison, score breakdown
+  SkillsPanel   edit the parsed skills, then re-run
   ErrorNotice   every failure surface
 ```
+
+## Editing skills re-runs the search, always
+
+`PATCH /resumes/{id}/skills` **deletes that resume's matches** — a score
+computed against the old skill set is wrong, not stale. So the panel never
+leaves the previous results on screen: it PATCHes, starts a new search, polls,
+and `ResultsView` remounts on the new run id.
+
+One explicit "Update matches" button rather than auto-save per toggle. Five
+quick edits would otherwise fire five overlapping re-scores that race and make
+the ranking flicker.
+
+## Design
+
+Oswald (heavy condensed) for headings, job titles and scores; Inter for body.
+Near-monochrome on warm off-white, hairline rules, no shadows, 2px radii.
+
+**The tier badge is the only saturated colour in the interface.** Because
+nothing else is coloured, it reads instantly. Each badge carries a text label
+too — colour alone is unreadable for roughly 1 in 12 men.
+
+Measured contrast: strong 6.72:1, moderate 6.29:1, weak 6.81:1 (ink on tint);
+body 8.41:1, secondary meta 4.77:1. All above the 4.5:1 AA floor.
 
 ## Two rules the results view is built on
 

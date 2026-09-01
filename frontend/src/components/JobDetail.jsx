@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { getJob } from '../api/client'
 import { ErrorNotice, describeError } from './ErrorNotice'
 
@@ -10,10 +10,11 @@ import { ErrorNotice, describeError } from './ErrorNotice'
  * while the match knows the *comparison* (which of those the resume has, and
  * the score breakdown). Neither is derivable from the other.
  */
-export function JobDetail({ match }) {
+export function JobDetail({ match, onClose }) {
   const [job, setJob] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(false)
+  const ref = useRef(null)
 
   useEffect(() => {
     if (!match) return undefined
@@ -31,6 +32,13 @@ export function JobDetail({ match }) {
         if (!controller.signal.aborted) setLoading(false)
       })
 
+    // Stacked layout only: the panel sits below the fold, so a click would
+    // otherwise appear to do nothing. matchMedia rather than a resize
+    // listener — this is a one-shot question, not a subscription.
+    if (window.matchMedia('(max-width: 900px)').matches) {
+      ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+
     // Aborting on change matters when clicking down a list quickly: without it
     // a slow earlier request can resolve last and overwrite the current job.
     return () => controller.abort()
@@ -45,7 +53,12 @@ export function JobDetail({ match }) {
   }
 
   return (
-    <aside className="detail">
+    <aside className="detail" ref={ref}>
+      {/* Only shown once the split view has stacked; on a wide screen the list
+          is still visible beside this, so there is nothing to go back to. */}
+      <button type="button" className="detail__back" onClick={onClose}>
+        ← Back to results
+      </button>
       <h2 className="detail__title">{match.title}</h2>
       <p className="detail__company">
         {match.company}

@@ -20,8 +20,8 @@ import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 // back to running on the main thread (or fails outright in a build).
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
 
-export const MAX_FILE_BYTES = 5 * 1024 * 1024
-export const ACCEPTED_EXTENSIONS = ['.pdf', '.docx']
+export { ACCEPTED_EXTENSIONS, MAX_FILE_BYTES } from './constants'
+import { ACCEPTED_EXTENSIONS, MAX_FILE_BYTES } from './constants'
 
 /** Below this many characters, a "successful" extraction is not a resume. */
 const MIN_USEFUL_CHARS = 120

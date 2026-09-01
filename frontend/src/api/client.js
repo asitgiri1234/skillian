@@ -186,6 +186,23 @@ export function getMatches({
   return request(`/matches?${params}`, { signal })
 }
 
+/**
+ * Replace a resume's skill list.
+ *
+ * **This deletes every match for the resume.** The backend re-embeds and drops
+ * the match rows, because a score computed against the old skill set is wrong
+ * rather than merely stale. The caller must re-run the search; showing the
+ * previous results afterwards would be showing results for a resume that no
+ * longer exists.
+ */
+export function updateResumeSkills(resumeId, skills, { signal } = {}) {
+  return request(`/resumes/${resumeId}/skills`, {
+    method: 'PATCH',
+    body: { skills },
+    signal,
+  })
+}
+
 export function getJob(jobId, { signal } = {}) {
   return request(`/jobs/${jobId}`, { signal })
 }

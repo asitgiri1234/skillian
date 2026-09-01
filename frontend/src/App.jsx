@@ -35,6 +35,30 @@ export default function App() {
     }
   }
 
+  /**
+   * PATCH /resumes/{id}/skills deletes every match for the resume, so the only
+   * correct next step is a fresh search. Showing the previous results would be
+   * showing results for a skill set that no longer exists.
+   *
+   * The re-run is cheap: the jobs are already stored, chunked and embedded, so
+   * only scoring repeats.
+   */
+  async function handleSkillsUpdated(updatedResume) {
+    setResume(updatedResume)
+    setFinishedRun(null)
+    setRunId(null)
+    setSearching(true)
+    setSearchError(null)
+    try {
+      const run = await createSearch({ resumeId: updatedResume.id })
+      setRunId(run.run_id)
+    } catch (cause) {
+      setSearchError(cause)
+    } finally {
+      setSearching(false)
+    }
+  }
+
   function restart() {
     // Clearing runId is what unmounts PollingView and stops its poller.
     setRunId(null)
@@ -46,9 +70,13 @@ export default function App() {
     <main className={finishedRun ? 'app app--wide' : 'app'}>
       {finishedRun ? (
         <ResultsView
-          resumeId={resume.id}
+          /* Keyed on the run: a re-run must remount, clearing the selected
+             job and the page number along with the stale match list. */
+          key={finishedRun.run_id}
+          resume={resume}
           jobsFound={finishedRun.jobs_found}
           onRestart={restart}
+          onSkillsUpdated={handleSkillsUpdated}
         />
       ) : runId ? (
         <PollingView runId={runId} onRestart={restart} onDone={setFinishedRun} />
